@@ -48,7 +48,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/vanloctech/bun-spreadsheet.git"
+    "url": "git+https://github.com/vanloctech/bun-spreadsheet.git"
   },
   "bugs": {
     "url": "https://github.com/vanloctech/bun-spreadsheet/issues"
