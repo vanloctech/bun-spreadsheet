@@ -42,6 +42,7 @@ Complete API reference for bun-spreadsheet.
   - [Formulas](#formulas)
   - [Hyperlinks](#hyperlinks-1)
   - [Merge Cells](#merge-cells)
+  - [Auto Filters](#auto-filters)
   - [Freeze Panes](#freeze-panes)
   - [Split Views](#split-views)
   - [Data Validation](#data-validation)
@@ -345,6 +346,7 @@ Create a streaming Excel writer. Serializes each row to XML immediately but keep
 | `freezePane` | `{ row, col }` | `undefined` | Freeze pane position |
 | `splitPane` | `SplitPane` | `undefined` | Split view configuration |
 | `mergeCells` | `MergeCell[]` | `undefined` | Merge cell ranges |
+| `autoFilter` | `CellRange` | `undefined` | Auto filter range |
 | `creator` | `string` | `undefined` | Author name |
 | `created` | `Date` | `undefined` | Created timestamp in workbook metadata |
 | `modified` | `Date` | `undefined` | Modified timestamp in workbook metadata |
@@ -413,6 +415,7 @@ Create a streaming Excel writer with support for multiple sheets.
 | `freezePane` | `{ row, col }` | Freeze pane |
 | `splitPane` | `SplitPane` | Split view |
 | `mergeCells` | `MergeCell[]` | Merge cell ranges |
+| `autoFilter` | `CellRange` | Auto filter range |
 
 **Example:**
 
@@ -522,6 +525,7 @@ interface Worksheet {
   rows: Row[];                               // Array of rows
   columns?: ColumnConfig[];                  // Column configurations
   mergeCells?: MergeCell[];                  // Merged cell ranges
+  autoFilter?: CellRange;                    // Auto filter range
   dataValidations?: DataValidation[];        // Data validation rules
   conditionalFormattings?: ConditionalFormatting[]; // Conditional formatting rules
   freezePane?: { row: number; col: number }; // Freeze pane position
@@ -961,6 +965,26 @@ const worksheet: Worksheet = {
 
 ---
 
+### Auto Filters
+
+Use `autoFilter` to enable Excel's dropdown filters on a header/data range.
+
+```typescript
+const worksheet: Worksheet = {
+  name: "Filtered",
+  rows: [
+    { cells: [{ value: "Name" }, { value: "Score" }] },
+    { cells: [{ value: "Alice" }, { value: 95 }] },
+    { cells: [{ value: "Bob" }, { value: 87 }] },
+  ],
+  autoFilter: { startRow: 0, startCol: 0, endRow: 100, endCol: 1 },
+};
+```
+
+This writes Excel's `<autoFilter>` range and `readExcel()` returns the same range back.
+
+---
+
 ### Freeze Panes
 
 Freeze rows and/or columns so they stay visible when scrolling.
@@ -1172,6 +1196,7 @@ const worksheet: Worksheet = {
 | Workbook properties | Full support | Full support | Full support |
 | Hyperlinks | Full support | Full support | Full support |
 | Merge Cells | Full support | Full support | Full support |
+| Auto Filters | Full support | Full support | Full support |
 | Freeze Panes | Full support | Full support | Full support |
 | Split Views | Full support | Full support | Full support |
 | Data Validation | Full support | Full support | Full support |

@@ -19,6 +19,7 @@ import type {
   Workbook,
   Worksheet,
 } from '../types';
+import { parseAutoFilter } from './auto-filter';
 import { parseConditionalFormattings } from './conditional-formatting';
 import { parseDataValidations } from './data-validation';
 import { excelSerialToDate } from './xlsx-writer';
@@ -598,6 +599,11 @@ function parseWorksheet(
         });
       }
     }
+  }
+
+  const autoFilter = parseAutoFilter(root);
+  if (autoFilter) {
+    worksheet.autoFilter = autoFilter;
   }
 
   const conditionalFormattings = parseConditionalFormattings(

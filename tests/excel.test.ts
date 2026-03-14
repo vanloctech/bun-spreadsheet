@@ -98,6 +98,31 @@ describe('Excel Writer', () => {
     });
   });
 
+  test('writes auto filter', async () => {
+    const path = `${TMP}/autofilter.xlsx`;
+    await writeExcel(path, {
+      worksheets: [
+        {
+          name: 'Filtered',
+          rows: [
+            { cells: [{ value: 'Name' }, { value: 'Score' }] },
+            { cells: [{ value: 'Alice' }, { value: 95 }] },
+            { cells: [{ value: 'Bob' }, { value: 87 }] },
+          ],
+          autoFilter: { startRow: 0, startCol: 0, endRow: 2, endCol: 1 },
+        },
+      ],
+    });
+
+    const wb = await readExcel(path);
+    expect(wb.worksheets[0].autoFilter).toEqual({
+      startRow: 0,
+      startCol: 0,
+      endRow: 2,
+      endCol: 1,
+    });
+  });
+
   test('writes freeze pane', async () => {
     const path = `${TMP}/freeze.xlsx`;
     await writeExcel(path, {

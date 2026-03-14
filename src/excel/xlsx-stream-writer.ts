@@ -7,6 +7,7 @@ import { resolve } from 'node:path';
 import { type Zippable, zipSync } from 'fflate';
 import type {
   Cell,
+  CellRange,
   CellStyle,
   CellValue,
   ColumnConfig,
@@ -19,6 +20,7 @@ import type {
   Workbook,
   Worksheet,
 } from '../types';
+import { buildAutoFilterXML } from './auto-filter';
 import { buildConditionalFormattingsXML } from './conditional-formatting';
 import { buildDataValidationsXML } from './data-validation';
 import { StyleRegistry } from './style-builder';
@@ -61,6 +63,8 @@ export interface ExcelStreamOptions extends ExcelWriteOptions {
   splitPane?: Worksheet['splitPane'];
   /** Merge cells */
   mergeCells?: MergeCell[];
+  /** Auto filter range */
+  autoFilter?: CellRange;
   /** Conditional formatting rules */
   conditionalFormattings?: ConditionalFormatting[];
   /** Data validation rules */
@@ -300,6 +304,11 @@ export class ExcelStreamWriter implements StreamWriter {
       wsXml += '</mergeCells>';
     }
 
+    const autoFilterXml = buildAutoFilterXML(this.options.autoFilter);
+    if (autoFilterXml) {
+      wsXml += autoFilterXml;
+    }
+
     const conditionalFormattingXml = buildConditionalFormattingsXML(
       this.options.conditionalFormattings,
       this.styleRegistry,
@@ -453,6 +462,7 @@ export class MultiSheetExcelStreamWriter {
         name,
         rows: data.rows,
         columns: data.config.columns,
+        autoFilter: data.config.autoFilter,
         conditionalFormattings: data.config.conditionalFormattings,
         dataValidations: data.config.dataValidations,
         freezePane: data.config.freezePane,

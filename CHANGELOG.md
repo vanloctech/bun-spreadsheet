@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Excel data validation support for dropdown lists, number ranges, date limits, and custom formulas
 - Read/write support for worksheet-level `dataValidations` across normal, streaming, and chunked Excel writers
 - Conditional formatting support for highlight rules, color scales, data bars, and icon sets
+- Auto filter support via worksheet-level `autoFilter`
 - Workbook metadata read/write support for `creator`, `created`, and `modified`
 - Split view support via worksheet-level `splitPane`
 - Gradient fill XML support for cell styles

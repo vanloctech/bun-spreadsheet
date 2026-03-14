@@ -42,6 +42,7 @@ bun-spreadsheet 完整 API 参考。
   - [公式](#公式)
   - [超链接](#超链接)
   - [合并单元格](#合并单元格)
+  - [自动筛选](#自动筛选)
   - [冻结窗格](#冻结窗格)
   - [拆分视图](#拆分视图)
   - [数据验证](#数据验证)
@@ -331,6 +332,7 @@ await stream.end();
 | `freezePane` | `{ row, col }` | `undefined` | 冻结窗格位置 |
 | `splitPane` | `SplitPane` | `undefined` | 拆分视图配置 |
 | `mergeCells` | `MergeCell[]` | `undefined` | 合并单元格区域 |
+| `autoFilter` | `CellRange` | `undefined` | 自动筛选范围 |
 | `creator` | `string` | `undefined` | 作者名称 |
 | `created` | `Date` | `undefined` | 工作簿元数据中的创建时间 |
 | `modified` | `Date` | `undefined` | 工作簿元数据中的修改时间 |
@@ -487,6 +489,7 @@ interface Worksheet {
   rows: Row[];                               // 行数组
   columns?: ColumnConfig[];                  // 列配置
   mergeCells?: MergeCell[];                  // 合并单元格区域
+  autoFilter?: CellRange;                    // 自动筛选范围
   dataValidations?: DataValidation[];        // 数据验证规则
   conditionalFormattings?: ConditionalFormatting[]; // 条件格式规则
   freezePane?: { row: number; col: number }; // 冻结窗格位置
@@ -892,6 +895,26 @@ const worksheet: Worksheet = {
 
 ---
 
+### 自动筛选
+
+使用 `autoFilter` 为表头/数据区域启用 Excel 的下拉筛选。
+
+```typescript
+const worksheet: Worksheet = {
+  name: "Filtered",
+  rows: [
+    { cells: [{ value: "Name" }, { value: "Score" }] },
+    { cells: [{ value: "Alice" }, { value: 95 }] },
+    { cells: [{ value: "Bob" }, { value: 87 }] },
+  ],
+  autoFilter: { startRow: 0, startCol: 0, endRow: 100, endCol: 1 },
+};
+```
+
+这会写入 Excel 的 `<autoFilter>` 区域，并且 `readExcel()` 会读回同样的范围。
+
+---
+
 ### 冻结窗格
 
 冻结行和/或列，使其在滚动时保持可见。
@@ -1103,6 +1126,7 @@ const worksheet: Worksheet = {
 | 工作簿属性 | 完整支持 | 完整支持 | 完整支持 |
 | 超链接 | 完整支持 | 完整支持 | 完整支持 |
 | 合并单元格 | 完整支持 | 完整支持 | 完整支持 |
+| 自动筛选 | 完整支持 | 完整支持 | 完整支持 |
 | 冻结窗格 | 完整支持 | 完整支持 | 完整支持 |
 | 拆分视图 | 完整支持 | 完整支持 | 完整支持 |
 | 数据验证 | 完整支持 | 完整支持 | 完整支持 |

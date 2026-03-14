@@ -16,6 +16,7 @@ import { join, resolve } from 'node:path';
 import { type Zippable, zipSync } from 'fflate';
 import type {
   Cell,
+  CellRange,
   CellStyle,
   CellValue,
   ColumnConfig,
@@ -27,6 +28,7 @@ import type {
   StreamWriter,
   Worksheet,
 } from '../types';
+import { buildAutoFilterXML } from './auto-filter';
 import { buildConditionalFormattingsXML } from './conditional-formatting';
 import { buildDataValidationsXML } from './data-validation';
 import { StyleRegistry } from './style-builder';
@@ -68,6 +70,8 @@ export interface ChunkedExcelStreamOptions extends ExcelWriteOptions {
   splitPane?: Worksheet['splitPane'];
   /** Merge cells */
   mergeCells?: MergeCell[];
+  /** Auto filter range */
+  autoFilter?: CellRange;
   /** Conditional formatting rules */
   conditionalFormattings?: ConditionalFormatting[];
   /** Data validation rules */
@@ -318,6 +322,11 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
         wsFooter += `<mergeCell ref="${startRef}:${endRef}"/>`;
       }
       wsFooter += '</mergeCells>';
+    }
+
+    const autoFilterXml = buildAutoFilterXML(this.options.autoFilter);
+    if (autoFilterXml) {
+      wsFooter += autoFilterXml;
     }
 
     const conditionalFormattingXml = buildConditionalFormattingsXML(

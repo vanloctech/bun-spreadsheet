@@ -252,6 +252,7 @@ export interface Worksheet {
   rows: Row[];
   columns?: ColumnConfig[];
   mergeCells?: MergeCell[];
+  autoFilter?: CellRange;
   dataValidations?: DataValidation[];
   conditionalFormattings?: ConditionalFormatting[];
   freezePane?: { row: number; col: number };

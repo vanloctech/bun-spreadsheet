@@ -145,6 +145,26 @@ describe('Excel Stream Writer', () => {
     expect(wb.worksheets[0].mergeCells).toHaveLength(1);
   });
 
+  test('writes stream with auto filter', async () => {
+    const path = `${TMP}/stream-autofilter.xlsx`;
+    const stream = createExcelStream(path, {
+      sheetName: 'Filtered',
+      autoFilter: { startRow: 0, startCol: 0, endRow: 10, endCol: 1 },
+    });
+
+    stream.writeRow(['Name', 'Score']);
+    stream.writeRow(['Alice', 95]);
+    await stream.end();
+
+    const wb = await readExcel(path);
+    expect(wb.worksheets[0].autoFilter).toEqual({
+      startRow: 0,
+      startCol: 0,
+      endRow: 10,
+      endCol: 1,
+    });
+  });
+
   test('writes stream with data validation', async () => {
     const path = `${TMP}/stream-validation.xlsx`;
     const stream = createExcelStream(path, {
@@ -307,6 +327,26 @@ describe('Chunked Stream Writer', () => {
 
     const wb = await readExcel(path);
     expect(wb.worksheets[0].freezePane).toEqual({ row: 1, col: 0 });
+  });
+
+  test('chunked stream with auto filter', async () => {
+    const path = `${TMP}/chunked-autofilter.xlsx`;
+    const stream = createChunkedExcelStream(path, {
+      sheetName: 'Filtered',
+      autoFilter: { startRow: 0, startCol: 0, endRow: 25, endCol: 2 },
+    });
+
+    stream.writeRow(['Name', 'Score', 'Team']);
+    stream.writeRow(['Alice', 95, 'A']);
+    await stream.end();
+
+    const wb = await readExcel(path);
+    expect(wb.worksheets[0].autoFilter).toEqual({
+      startRow: 0,
+      startCol: 0,
+      endRow: 25,
+      endCol: 2,
+    });
   });
 
   test('chunked stream with split pane', async () => {
