@@ -117,6 +117,34 @@ describe('Excel Writer', () => {
     expect(wb.worksheets[0].freezePane).toEqual({ row: 1, col: 0 });
   });
 
+  test('writes split pane', async () => {
+    const path = `${TMP}/split.xlsx`;
+    await writeExcel(path, {
+      worksheets: [
+        {
+          name: 'Split',
+          rows: [
+            { cells: [{ value: 'Header' }] },
+            { cells: [{ value: 'Data' }] },
+          ],
+          splitPane: {
+            x: 1200,
+            y: 1800,
+            topLeftCell: { row: 1, col: 1 },
+          },
+        },
+      ],
+    });
+
+    const wb = await readExcel(path);
+    expect(wb.worksheets[0].splitPane).toEqual({
+      x: 1200,
+      y: 1800,
+      topLeftCell: { row: 1, col: 1 },
+    });
+    expect(wb.worksheets[0].freezePane).toBeUndefined();
+  });
+
   test('writes column widths', async () => {
     const path = `${TMP}/columns.xlsx`;
     await writeExcel(path, {
@@ -227,6 +255,86 @@ describe('Excel Reader', () => {
     expect(cell.value).toBe(1234.5);
     // numberFormat is applied via style index; verify style exists
     expect(cell.style).toBeDefined();
+  });
+
+  test('reads workbook properties', async () => {
+    const path = `${TMP}/workbook-props.xlsx`;
+    const created = new Date('2026-02-01T10:00:00.000Z');
+    const modified = new Date('2026-02-02T12:30:00.000Z');
+
+    await writeExcel(path, {
+      worksheets: [{ name: 'Meta', rows: [{ cells: [{ value: 'Hello' }] }] }],
+      creator: 'bun-spreadsheet',
+      created,
+      modified,
+    });
+
+    const wb = await readExcel(path);
+    expect(wb.creator).toBe('bun-spreadsheet');
+    expect(wb.created?.toISOString()).toBe(created.toISOString());
+    expect(wb.modified?.toISOString()).toBe(modified.toISOString());
+  });
+
+  test('reads date cells as Date values when number format is date-based', async () => {
+    const path = `${TMP}/date-cells.xlsx`;
+    const input = new Date('2026-01-15T00:00:00.000Z');
+
+    await writeExcel(path, {
+      worksheets: [
+        {
+          name: 'Dates',
+          rows: [
+            {
+              cells: [
+                {
+                  value: input,
+                  style: { numberFormat: 'yyyy-mm-dd' },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    const cell = (await readExcel(path)).worksheets[0].rows[0].cells[0];
+    expect(cell.type).toBe('date');
+    expect(cell.value).toBeInstanceOf(Date);
+    expect((cell.value as Date).toISOString()).toBe(input.toISOString());
+  });
+
+  test('writes and reads gradient fills', async () => {
+    const path = `${TMP}/gradient-fill.xlsx`;
+    await writeExcel(path, {
+      worksheets: [
+        {
+          name: 'Gradient',
+          rows: [
+            {
+              cells: [
+                {
+                  value: 'Heatmap',
+                  style: {
+                    fill: {
+                      type: 'gradient',
+                      fgColor: 'FFF2CC',
+                      bgColor: 'F4B183',
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    const cell = (await readExcel(path)).worksheets[0].rows[0].cells[0];
+    expect(cell.style?.fill).toEqual({
+      type: 'gradient',
+      fgColor: 'FFF2CC',
+      bgColor: 'F4B183',
+    });
   });
 });
 

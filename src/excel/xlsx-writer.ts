@@ -9,16 +9,18 @@ import { buildConditionalFormattingsXML } from './conditional-formatting';
 import { buildDataValidationsXML } from './data-validation';
 import { StyleRegistry } from './style-builder';
 import {
+  buildAppPropsXML,
   buildCellRef,
   buildContentTypes,
+  buildCorePropsXML,
   buildRootRels,
   buildSharedStrings,
+  buildSheetViewsXML,
   buildWorkbookRels,
   buildWorkbookXML,
   escapeXML,
   getFiniteNumber,
   getFiniteNumberOr,
-  getNonNegativeIntegerOr,
 } from './xml-builder';
 
 const encoder = new TextEncoder();
@@ -88,17 +90,10 @@ export function buildExcelBuffer(
     xml +=
       '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
 
-    // Sheet views (freeze pane)
-    if (worksheet.freezePane) {
-      xml += '<sheetViews>';
-      xml += '<sheetView tabSelected="1" workbookViewId="0">';
-      const row = getNonNegativeIntegerOr(worksheet.freezePane.row, 0);
-      const col = getNonNegativeIntegerOr(worksheet.freezePane.col, 0);
-      const topLeftCell = buildCellRef(row, col);
-      xml += `<pane xSplit="${col}" ySplit="${row}" topLeftCell="${topLeftCell}" activePane="bottomRight" state="frozen"/>`;
-      xml += '</sheetView>';
-      xml += '</sheetViews>';
-    }
+    xml += buildSheetViewsXML({
+      freezePane: worksheet.freezePane,
+      splitPane: worksheet.splitPane,
+    });
 
     // Sheet format properties
     xml += `<sheetFormatPr defaultRowHeight="${getFiniteNumberOr(worksheet.defaultRowHeight, 15)}"`;
@@ -314,10 +309,22 @@ export function buildExcelBuffer(
     sheetResults.push(buildWorksheetXML(workbook.worksheets[si], si));
   }
 
+  const workbookCreator = options?.creator ?? workbook.creator;
+  const workbookCreated = options?.created ?? workbook.created;
+  const workbookModified = options?.modified ?? workbook.modified;
+
   // Build ZIP structure
   const files: Zippable = {
     '[Content_Types].xml': encoder.encode(buildContentTypes(sheetNames.length)),
     '_rels/.rels': encoder.encode(buildRootRels()),
+    'docProps/app.xml': encoder.encode(buildAppPropsXML(sheetNames)),
+    'docProps/core.xml': encoder.encode(
+      buildCorePropsXML({
+        creator: workbookCreator,
+        created: workbookCreated,
+        modified: workbookModified,
+      }),
+    ),
     'xl/_rels/workbook.xml.rels': encoder.encode(
       buildWorkbookRels(sheetNames.length),
     ),

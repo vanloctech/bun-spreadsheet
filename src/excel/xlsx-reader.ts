@@ -21,7 +21,8 @@ import type {
 } from '../types';
 import { parseConditionalFormattings } from './conditional-formatting';
 import { parseDataValidations } from './data-validation';
-import { letterToColIndex } from './xml-builder';
+import { excelSerialToDate } from './xlsx-writer';
+import { letterToColIndex, parseCellRef } from './xml-builder';
 import {
   findChild,
   findChildren,
@@ -34,6 +35,20 @@ import {
 const CELL_REF_REGEX = /^([A-Z]+)(\d+)$/;
 const RGB_PREFIX_REGEX = /^FF/;
 const COL_LETTER_REGEX = /^([A-Z]+)/;
+const BUILTIN_NUMFMTS: Record<number, string> = {
+  14: 'yyyy-mm-dd',
+  15: 'd-mmm-yy',
+  16: 'd-mmm',
+  17: 'mmm-yy',
+  18: 'h:mm AM/PM',
+  19: 'h:mm:ss AM/PM',
+  20: 'h:mm',
+  21: 'h:mm:ss',
+  22: 'm/d/yy h:mm',
+  45: 'mm:ss',
+  46: '[h]:mm:ss',
+  47: 'mmss.0',
+};
 
 /** Security limits */
 const MAX_FILE_SIZE = 200 * 1024 * 1024; // 200MB max file size
@@ -131,6 +146,8 @@ export async function readExcel(
     relMap.set(rel.attributes.Id, rel.attributes.Target);
   }
 
+  const workbookProps = parseWorkbookProperties(zip, decoder);
+
   // Parse worksheets
   const worksheets: Worksheet[] = [];
 
@@ -190,7 +207,43 @@ export async function readExcel(
     worksheets.push(worksheet);
   }
 
-  return { worksheets };
+  return { worksheets, ...workbookProps };
+}
+
+function parseWorkbookProperties(
+  zip: Record<string, Uint8Array>,
+  decoder: TextDecoder,
+): Pick<Workbook, 'creator' | 'created' | 'modified'> {
+  const coreProps = zip['docProps/core.xml'];
+  if (!coreProps) return {};
+
+  const xml = decoder.decode(coreProps);
+  const doc = parseXML(xml);
+  const root = doc.children[0];
+  if (!root) return {};
+
+  const props: Pick<Workbook, 'creator' | 'created' | 'modified'> = {};
+  const creator = findChild(root, 'creator');
+  const created = findChild(root, 'created');
+  const modified = findChild(root, 'modified');
+
+  if (creator) {
+    props.creator = getTextContent(creator);
+  }
+
+  const createdValue = created ? new Date(getTextContent(created)) : undefined;
+  if (createdValue && !Number.isNaN(createdValue.getTime())) {
+    props.created = createdValue;
+  }
+
+  const modifiedValue = modified
+    ? new Date(getTextContent(modified))
+    : undefined;
+  if (modifiedValue && !Number.isNaN(modifiedValue.getTime())) {
+    props.modified = modifiedValue;
+  }
+
+  return props;
 }
 
 /**
@@ -351,6 +404,29 @@ function parseFontNode(fontNode: XMLNode): FontStyle {
 }
 
 function parseFillNode(fillNode: XMLNode): FillStyle {
+  const gradientFill =
+    fillNode.tag === 'gradientFill'
+      ? fillNode
+      : findChild(fillNode, 'gradientFill');
+  if (gradientFill) {
+    const stops = findChildren(gradientFill, 'stop');
+    const firstColor = stops[0]
+      ? findChild(stops[0], 'color')?.attributes.rgb
+      : undefined;
+    const lastColor =
+      stops.length > 0
+        ? findChild(stops[stops.length - 1], 'color')?.attributes.rgb
+        : undefined;
+    const fill: FillStyle = { type: 'gradient' };
+    if (firstColor) {
+      fill.fgColor = firstColor.replace(RGB_PREFIX_REGEX, '');
+    }
+    if (lastColor) {
+      fill.bgColor = lastColor.replace(RGB_PREFIX_REGEX, '');
+    }
+    return fill;
+  }
+
   const patternFill =
     fillNode.tag === 'patternFill'
       ? fillNode
@@ -416,6 +492,24 @@ function parseAlignmentNode(alignment: XMLNode): AlignmentStyle {
   return style;
 }
 
+function isDateNumberFormat(numberFormat: string | undefined): boolean {
+  if (!numberFormat) return false;
+
+  const normalized = numberFormat
+    .toLowerCase()
+    .replace(/"[^"]*"/g, '')
+    .replace(/\[[^\]]*]/g, '')
+    .replace(/\\./g, '');
+
+  const hasDateToken =
+    normalized.includes('y') ||
+    normalized.includes('d') ||
+    normalized.includes('h') ||
+    normalized.includes('s');
+
+  return hasDateToken || (normalized.includes('m') && normalized.includes('/'));
+}
+
 function parseCellXfStyle(
   xf: XMLNode,
   fonts: FontStyle[],
@@ -439,7 +533,8 @@ function parseCellXfStyle(
     style.border = bordersList[borderId];
   }
   if (xf.attributes.applyNumberFormat === '1' && numFmtId > 0) {
-    style.numberFormat = numFmtMap.get(numFmtId) || '';
+    style.numberFormat =
+      numFmtMap.get(numFmtId) || BUILTIN_NUMFMTS[numFmtId] || '';
   }
 
   const alignment = findChild(xf, 'alignment');
@@ -607,6 +702,15 @@ function parseWorksheet(
         cell.style = styles[styleIndex];
       }
 
+      const numberFormat =
+        styleIndex >= 0 ? styles[styleIndex]?.numberFormat : undefined;
+      if (typeof cell.value === 'number' && isDateNumberFormat(numberFormat)) {
+        cell.value = excelSerialToDate(cell.value);
+        if (!cell.formula) {
+          cell.type = 'date';
+        }
+      }
+
       cells[colIndex] = cell;
     }
 
@@ -668,10 +772,18 @@ function parseWorksheet(
     if (sheetView) {
       const pane = findChild(sheetView, 'pane');
       if (pane) {
-        const xSplit = Number.parseInt(pane.attributes.xSplit || '0', 10);
-        const ySplit = Number.parseInt(pane.attributes.ySplit || '0', 10);
-        if (xSplit > 0 || ySplit > 0) {
+        const state = pane.attributes.state;
+        const xSplit = Number.parseFloat(pane.attributes.xSplit || '0');
+        const ySplit = Number.parseFloat(pane.attributes.ySplit || '0');
+        if (state === 'frozen' && (xSplit > 0 || ySplit > 0)) {
           worksheet.freezePane = { row: ySplit, col: xSplit };
+        } else if (xSplit > 0 || ySplit > 0) {
+          const topLeftRef = pane.attributes.topLeftCell;
+          worksheet.splitPane = {
+            x: xSplit,
+            y: ySplit,
+            topLeftCell: topLeftRef ? parseCellRef(topLeftRef) : undefined,
+          };
         }
       }
     }

@@ -53,6 +53,7 @@ export type {
   Hyperlink,
   MergeCell,
   Row,
+  SplitPane,
   StreamWriter,
   Workbook,
   Worksheet,

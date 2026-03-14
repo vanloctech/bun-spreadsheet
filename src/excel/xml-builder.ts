@@ -2,6 +2,8 @@
 // XML Builder for XLSX generation
 // ============================================
 
+import type { SplitPane } from '../types';
+
 // Top-level regex for performance (biome: useTopLevelRegex)
 const CELL_REF_PARSE_REGEX = /^([A-Z]+)(\d+)$/;
 
@@ -140,6 +142,10 @@ export function buildContentTypes(sheetCount: number): string {
     '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>';
   xml += '<Default Extension="xml" ContentType="application/xml"/>';
   xml +=
+    '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>';
+  xml +=
+    '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>';
+  xml +=
     '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>';
   xml +=
     '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>';
@@ -163,6 +169,10 @@ export function buildRootRels(): string {
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
   xml +=
     '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>';
+  xml +=
+    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>';
+  xml +=
+    '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>';
   xml += '</Relationships>';
   return xml;
 }
@@ -201,6 +211,92 @@ export function buildWorkbookXML(sheetNames: string[]): string {
   xml += '</sheets>';
   xml += '</workbook>';
   return xml;
+}
+
+function formatW3CDate(value: Date): string {
+  return value.toISOString();
+}
+
+export function buildCorePropsXML(metadata: {
+  creator?: string;
+  created?: Date;
+  modified?: Date;
+}): string {
+  let xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+  xml +=
+    '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">';
+
+  if (metadata.creator) {
+    xml += `<dc:creator>${escapeXML(metadata.creator)}</dc:creator>`;
+    xml += `<cp:lastModifiedBy>${escapeXML(metadata.creator)}</cp:lastModifiedBy>`;
+  }
+  if (metadata.created) {
+    xml += `<dcterms:created xsi:type="dcterms:W3CDTF">${formatW3CDate(metadata.created)}</dcterms:created>`;
+  }
+  if (metadata.modified) {
+    xml += `<dcterms:modified xsi:type="dcterms:W3CDTF">${formatW3CDate(metadata.modified)}</dcterms:modified>`;
+  }
+
+  xml += '</cp:coreProperties>';
+  return xml;
+}
+
+export function buildAppPropsXML(sheetNames: string[]): string {
+  let xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+  xml +=
+    '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">';
+  xml += '<Application>bun-spreadsheet</Application>';
+  xml += '<HeadingPairs>';
+  xml += '<vt:vector size="2" baseType="variant">';
+  xml += '<vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant>';
+  xml += `<vt:variant><vt:i4>${sheetNames.length}</vt:i4></vt:variant>`;
+  xml += '</vt:vector>';
+  xml += '</HeadingPairs>';
+  xml += `<TitlesOfParts><vt:vector size="${sheetNames.length}" baseType="lpstr">`;
+  for (const sheetName of sheetNames) {
+    xml += `<vt:lpstr>${escapeXML(sheetName)}</vt:lpstr>`;
+  }
+  xml += '</vt:vector></TitlesOfParts>';
+  xml += '</Properties>';
+  return xml;
+}
+
+function getActivePane(xSplit: number, ySplit: number): string {
+  if (xSplit > 0 && ySplit > 0) return 'bottomRight';
+  if (xSplit > 0) return 'topRight';
+  if (ySplit > 0) return 'bottomLeft';
+  return 'topLeft';
+}
+
+export function buildSheetViewsXML(config: {
+  freezePane?: { row: number; col: number };
+  splitPane?: SplitPane;
+}): string {
+  if (config.freezePane) {
+    const row = getNonNegativeIntegerOr(config.freezePane.row, 0);
+    const col = getNonNegativeIntegerOr(config.freezePane.col, 0);
+    const topLeftCell = buildCellRef(row, col);
+    return `<sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane xSplit="${col}" ySplit="${row}" topLeftCell="${topLeftCell}" activePane="bottomRight" state="frozen"/></sheetView></sheetViews>`;
+  }
+
+  if (config.splitPane) {
+    const x = Math.max(0, getFiniteNumberOr(config.splitPane.x, 0));
+    const y = Math.max(0, getFiniteNumberOr(config.splitPane.y, 0));
+    if (x === 0 && y === 0) return '';
+
+    let xml = '<sheetViews><sheetView tabSelected="1" workbookViewId="0">';
+    xml += `<pane xSplit="${x}" ySplit="${y}" activePane="${getActivePane(x, y)}" state="split"`;
+    if (config.splitPane.topLeftCell) {
+      xml += ` topLeftCell="${buildCellRef(
+        getNonNegativeIntegerOr(config.splitPane.topLeftCell.row, 0),
+        getNonNegativeIntegerOr(config.splitPane.topLeftCell.col, 0),
+      )}"`;
+    }
+    xml += '/></sheetView></sheetViews>';
+    return xml;
+  }
+
+  return '';
 }
 
 /**

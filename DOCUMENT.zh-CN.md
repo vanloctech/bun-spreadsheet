@@ -27,6 +27,7 @@ bun-spreadsheet 完整 API 参考。
   - [CellValue](#cellvalue)
   - [ColumnConfig](#columnconfig)
   - [MergeCell](#mergecell)
+  - [SplitPane](#splitpane)
   - [Hyperlink](#hyperlink)
   - [DataValidation](#datavalidation)
   - [ConditionalFormatting](#conditionalformatting)
@@ -42,6 +43,7 @@ bun-spreadsheet 完整 API 参考。
   - [超链接](#超链接)
   - [合并单元格](#合并单元格)
   - [冻结窗格](#冻结窗格)
+  - [拆分视图](#拆分视图)
   - [数据验证](#数据验证)
   - [条件格式](#条件格式)
 - [写入模式对比](#写入模式对比)
@@ -67,6 +69,8 @@ bun-spreadsheet 完整 API 参考。
 | 选项 | 类型 | 默认值 | 描述 |
 |------|------|--------|------|
 | `creator` | `string` | `undefined` | 文件元数据中的作者名称 |
+| `created` | `Date` | `undefined` | 工作簿元数据中的创建时间 |
+| `modified` | `Date` | `undefined` | 工作簿元数据中的修改时间 |
 | `compress` | `boolean` | `true` | 启用 ZIP 压缩 |
 
 **返回值：** `Promise<void>`
@@ -325,8 +329,11 @@ await stream.end();
 | `columns` | `ColumnConfig[]` | `undefined` | 列宽配置 |
 | `defaultRowHeight` | `number` | `15` | 默认行高 |
 | `freezePane` | `{ row, col }` | `undefined` | 冻结窗格位置 |
+| `splitPane` | `SplitPane` | `undefined` | 拆分视图配置 |
 | `mergeCells` | `MergeCell[]` | `undefined` | 合并单元格区域 |
 | `creator` | `string` | `undefined` | 作者名称 |
+| `created` | `Date` | `undefined` | 工作簿元数据中的创建时间 |
+| `modified` | `Date` | `undefined` | 工作簿元数据中的修改时间 |
 | `compress` | `boolean` | `true` | 启用 ZIP 压缩 |
 
 **返回值：** `ExcelStreamWriter`
@@ -470,6 +477,8 @@ interface Workbook {
 }
 ```
 
+`creator`、`created` 和 `modified` 会写入工作簿元数据，并在 `readExcel()` 时返回。
+
 ### Worksheet
 
 ```typescript
@@ -481,6 +490,7 @@ interface Worksheet {
   dataValidations?: DataValidation[];        // 数据验证规则
   conditionalFormattings?: ConditionalFormatting[]; // 条件格式规则
   freezePane?: { row: number; col: number }; // 冻结窗格位置
+  splitPane?: SplitPane;                     // 拆分视图配置
   defaultRowHeight?: number;                 // 默认行高
   defaultColWidth?: number;                  // 默认列宽
 }
@@ -533,6 +543,16 @@ interface MergeCell {
   startCol: number;    // 起始列（0 索引）
   endRow: number;      // 结束行（0 索引）
   endCol: number;      // 结束列（0 索引）
+}
+```
+
+### SplitPane
+
+```typescript
+interface SplitPane {
+  x: number;                               // 水平拆分位置
+  y: number;                               // 垂直拆分位置
+  topLeftCell?: { row: number; col: number }; // 可选的左上可见单元格
 }
 ```
 
@@ -719,7 +739,12 @@ interface FillStyle {
 
 // 浅灰色
 { fill: { type: "pattern", pattern: "solid", fgColor: "D9D9D9" } }
+
+// 简单渐变填充，使用首尾两端颜色
+{ fill: { type: "gradient", fgColor: "FFF2CC", bgColor: "F4B183" } }
 ```
+
+对于 `gradient`，`fgColor` 会作为起始色标，`bgColor` 会作为结束色标。
 
 ### BorderStyle
 
@@ -784,13 +809,15 @@ interface AlignmentStyle {
 | `"dd/mm/yyyy"` | `15/01/2024` | 日期（欧洲） |
 | `"hh:mm:ss"` | `14:30:00` | 时间 |
 
+读取 XLSX 时，如果数值单元格使用的是日期或时间数字格式，会自动返回为 `Date` 对象。
+
 ---
 
 ## 功能
 
 ### 公式
 
-写入带有可选缓存结果的公式。缓存结果在 Excel 重新计算之前显示。
+读写带有可选缓存结果的公式。缓存结果在 Excel 重新计算之前显示。
 
 ```typescript
 {
@@ -883,6 +910,26 @@ const worksheet: Worksheet = {
 | `{ row: 0, col: 1 }` | 冻结第一列 |
 | `{ row: 1, col: 1 }` | 冻结第一行和第一列 |
 | `{ row: 2, col: 0 }` | 冻结前 2 行 |
+
+---
+
+### 拆分视图
+
+如果你需要可滚动的拆分视图，而不是固定表头，可以使用 `splitPane`。
+
+```typescript
+const worksheet: Worksheet = {
+  name: "Split",
+  rows: [/* ... */],
+  splitPane: {
+    x: 1200,
+    y: 1800,
+    topLeftCell: { row: 1, col: 1 },
+  },
+};
+```
+
+`freezePane` 和 `splitPane` 是两种不同的 Excel 视图模式。如果同时提供，优先使用 `freezePane`。
 
 ---
 
@@ -1053,9 +1100,11 @@ const worksheet: Worksheet = {
 | 多工作表支持 | 通过 Workbook | `createMultiSheetExcelStream` | 不支持 |
 | 样式 | 完整支持 | 完整支持 | 完整支持 |
 | 公式 | 完整支持 | 完整支持 | 完整支持 |
+| 工作簿属性 | 完整支持 | 完整支持 | 完整支持 |
 | 超链接 | 完整支持 | 完整支持 | 完整支持 |
 | 合并单元格 | 完整支持 | 完整支持 | 完整支持 |
 | 冻结窗格 | 完整支持 | 完整支持 | 完整支持 |
+| 拆分视图 | 完整支持 | 完整支持 | 完整支持 |
 | 数据验证 | 完整支持 | 完整支持 | 完整支持 |
 | 条件格式 | 完整支持 | 完整支持 | 完整支持 |
 | 适用场景 | 中小型文件 | 中大型文件 | 超大文件（10 万+） |

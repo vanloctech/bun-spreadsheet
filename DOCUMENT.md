@@ -27,6 +27,7 @@ Complete API reference for bun-spreadsheet.
   - [CellValue](#cellvalue)
   - [ColumnConfig](#columnconfig)
   - [MergeCell](#mergecell)
+  - [SplitPane](#splitpane)
   - [Hyperlink](#hyperlink)
   - [DataValidation](#datavalidation)
   - [ConditionalFormatting](#conditionalformatting)
@@ -42,6 +43,7 @@ Complete API reference for bun-spreadsheet.
   - [Hyperlinks](#hyperlinks-1)
   - [Merge Cells](#merge-cells)
   - [Freeze Panes](#freeze-panes)
+  - [Split Views](#split-views)
   - [Data Validation](#data-validation)
   - [Conditional Formatting](#conditional-formatting)
 - [Writing Modes Comparison](#writing-modes-comparison)
@@ -67,6 +69,8 @@ Write a Workbook to an `.xlsx` file.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `creator` | `string` | `undefined` | Author name in file metadata |
+| `created` | `Date` | `undefined` | Created timestamp in workbook metadata |
+| `modified` | `Date` | `undefined` | Modified timestamp in workbook metadata |
 | `compress` | `boolean` | `true` | Enable ZIP compression |
 
 **Returns:** `Promise<void>`
@@ -339,8 +343,11 @@ Create a streaming Excel writer. Serializes each row to XML immediately but keep
 | `columns` | `ColumnConfig[]` | `undefined` | Column width configurations |
 | `defaultRowHeight` | `number` | `15` | Default row height |
 | `freezePane` | `{ row, col }` | `undefined` | Freeze pane position |
+| `splitPane` | `SplitPane` | `undefined` | Split view configuration |
 | `mergeCells` | `MergeCell[]` | `undefined` | Merge cell ranges |
 | `creator` | `string` | `undefined` | Author name |
+| `created` | `Date` | `undefined` | Created timestamp in workbook metadata |
+| `modified` | `Date` | `undefined` | Modified timestamp in workbook metadata |
 | `compress` | `boolean` | `true` | Enable ZIP compression |
 
 **Returns:** `ExcelStreamWriter`
@@ -404,6 +411,7 @@ Create a streaming Excel writer with support for multiple sheets.
 |--------|------|-------------|
 | `columns` | `ColumnConfig[]` | Column configurations for this sheet |
 | `freezePane` | `{ row, col }` | Freeze pane |
+| `splitPane` | `SplitPane` | Split view |
 | `mergeCells` | `MergeCell[]` | Merge cell ranges |
 
 **Example:**
@@ -504,6 +512,8 @@ interface Workbook {
 }
 ```
 
+`creator`, `created`, and `modified` are written into workbook metadata and returned by `readExcel()`.
+
 ### Worksheet
 
 ```typescript
@@ -515,6 +525,7 @@ interface Worksheet {
   dataValidations?: DataValidation[];        // Data validation rules
   conditionalFormattings?: ConditionalFormatting[]; // Conditional formatting rules
   freezePane?: { row: number; col: number }; // Freeze pane position
+  splitPane?: SplitPane;                     // Split view configuration
   defaultRowHeight?: number;                 // Default row height
   defaultColWidth?: number;                  // Default column width
 }
@@ -567,6 +578,16 @@ interface MergeCell {
   startCol: number;    // Start column (0-indexed)
   endRow: number;      // End row (0-indexed)
   endCol: number;      // End column (0-indexed)
+}
+```
+
+### SplitPane
+
+```typescript
+interface SplitPane {
+  x: number;                               // Horizontal split position
+  y: number;                               // Vertical split position
+  topLeftCell?: { row: number; col: number }; // Optional top-left visible cell
 }
 ```
 
@@ -753,7 +774,12 @@ interface FillStyle {
 
 // Light gray
 { fill: { type: "pattern", pattern: "solid", fgColor: "D9D9D9" } }
+
+// Simple gradient using first/last stop colors
+{ fill: { type: "gradient", fgColor: "FFF2CC", bgColor: "F4B183" } }
 ```
+
+For `gradient`, `fgColor` is used as the first stop and `bgColor` as the last stop.
 
 ### BorderStyle
 
@@ -850,13 +876,15 @@ Set `numberFormat` on CellStyle to control how numbers and dates display.
 { value: new Date("2024-01-15"), style: { numberFormat: "yyyy-mm-dd" } }
 ```
 
+When reading XLSX files, numeric cells with date/time number formats are automatically returned as `Date`.
+
 ---
 
 ## Features
 
 ### Formulas
 
-Write formulas with optional cached results. The cached result is shown before Excel recalculates.
+Write and read formulas with optional cached results. The cached result is shown before Excel recalculates.
 
 ```typescript
 {
@@ -951,6 +979,26 @@ const worksheet: Worksheet = {
 | `{ row: 0, col: 1 }` | Freeze first column |
 | `{ row: 1, col: 1 }` | Freeze first row and first column |
 | `{ row: 2, col: 0 }` | Freeze top 2 rows |
+
+---
+
+### Split Views
+
+Use `splitPane` when you want scrollable split views instead of frozen headers.
+
+```typescript
+const worksheet: Worksheet = {
+  name: "Split",
+  rows: [/* ... */],
+  splitPane: {
+    x: 1200,
+    y: 1800,
+    topLeftCell: { row: 1, col: 1 },
+  },
+};
+```
+
+`freezePane` and `splitPane` are different Excel view modes. If both are provided, `freezePane` takes precedence.
 
 ---
 
@@ -1121,9 +1169,11 @@ const worksheet: Worksheet = {
 | Multi-sheet | Via Workbook | `createMultiSheetExcelStream` | Not supported |
 | Styles | Full support | Full support | Full support |
 | Formulas | Full support | Full support | Full support |
+| Workbook properties | Full support | Full support | Full support |
 | Hyperlinks | Full support | Full support | Full support |
 | Merge Cells | Full support | Full support | Full support |
 | Freeze Panes | Full support | Full support | Full support |
+| Split Views | Full support | Full support | Full support |
 | Data Validation | Full support | Full support | Full support |
 | Conditional Formatting | Full support | Full support | Full support |
 | Best For | Small-medium files | Medium-large files | Very large files (100K+) |

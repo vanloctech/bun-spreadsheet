@@ -25,20 +25,23 @@ import type {
   MergeCell,
   Row,
   StreamWriter,
+  Worksheet,
 } from '../types';
 import { buildConditionalFormattingsXML } from './conditional-formatting';
 import { buildDataValidationsXML } from './data-validation';
 import { StyleRegistry } from './style-builder';
 import {
+  buildAppPropsXML,
   buildCellRef,
   buildContentTypes,
+  buildCorePropsXML,
   buildRootRels,
+  buildSheetViewsXML,
   buildWorkbookRels,
   buildWorkbookXML,
   escapeXML,
   getFiniteNumber,
   getFiniteNumberOr,
-  getNonNegativeIntegerOr,
 } from './xml-builder';
 
 /** Validate path for security */
@@ -61,6 +64,8 @@ export interface ChunkedExcelStreamOptions extends ExcelWriteOptions {
   defaultRowHeight?: number;
   /** Freeze pane */
   freezePane?: { row: number; col: number };
+  /** Split pane */
+  splitPane?: Worksheet['splitPane'];
   /** Merge cells */
   mergeCells?: MergeCell[];
   /** Conditional formatting rules */
@@ -274,17 +279,10 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
     wsHeader +=
       '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
 
-    // Freeze pane
-    if (this.options.freezePane) {
-      wsHeader += '<sheetViews>';
-      wsHeader += '<sheetView tabSelected="1" workbookViewId="0">';
-      const row = getNonNegativeIntegerOr(this.options.freezePane.row, 0);
-      const col = getNonNegativeIntegerOr(this.options.freezePane.col, 0);
-      const topLeftCell = buildCellRef(row, col);
-      wsHeader += `<pane xSplit="${col}" ySplit="${row}" topLeftCell="${topLeftCell}" activePane="bottomRight" state="frozen"/>`;
-      wsHeader += '</sheetView>';
-      wsHeader += '</sheetViews>';
-    }
+    wsHeader += buildSheetViewsXML({
+      freezePane: this.options.freezePane,
+      splitPane: this.options.splitPane,
+    });
 
     // Sheet format
     wsHeader += `<sheetFormatPr defaultRowHeight="${getFiniteNumberOr(this.options.defaultRowHeight, 15)}"/>`;
@@ -359,6 +357,14 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
     const files: Zippable = {
       '[Content_Types].xml': encoder.encode(buildContentTypes(1)),
       '_rels/.rels': encoder.encode(buildRootRels()),
+      'docProps/app.xml': encoder.encode(buildAppPropsXML([sheetName])),
+      'docProps/core.xml': encoder.encode(
+        buildCorePropsXML({
+          creator: this.options.creator,
+          created: this.options.created,
+          modified: this.options.modified,
+        }),
+      ),
       'xl/_rels/workbook.xml.rels': encoder.encode(buildWorkbookRels(1)),
       'xl/workbook.xml': encoder.encode(buildWorkbookXML([sheetName])),
       'xl/styles.xml': encoder.encode(this.styleRegistry.buildStylesXML()),

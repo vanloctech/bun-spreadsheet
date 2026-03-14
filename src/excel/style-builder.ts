@@ -12,6 +12,10 @@ import type {
 } from '../types';
 import { escapeXML, getFiniteNumberOr } from './xml-builder';
 
+function normalizeFillColor(color: string | undefined): string | undefined {
+  return color ? `FF${escapeXML(color)}` : undefined;
+}
+
 /** Internal style registry to deduplicate and index styles */
 export class StyleRegistry {
   private fonts: string[] = [];
@@ -121,16 +125,25 @@ export class StyleRegistry {
     if (fill.type === 'pattern') {
       xml += `<patternFill patternType="${escapeXML(fill.pattern || 'solid')}">`;
       if (fill.fgColor) {
-        xml += `<fgColor rgb="FF${escapeXML(fill.fgColor)}"/>`;
+        xml += `<fgColor rgb="${normalizeFillColor(fill.fgColor)}"/>`;
       }
       if (fill.bgColor) {
-        xml += `<bgColor rgb="FF${escapeXML(fill.bgColor)}"/>`;
+        xml += `<bgColor rgb="${normalizeFillColor(fill.bgColor)}"/>`;
       } else if (fill.fgColor && fill.pattern === 'solid') {
         xml += `<bgColor indexed="64"/>`;
       }
       xml += '</patternFill>';
     } else {
-      xml += '<patternFill patternType="none"/>';
+      const startColor = normalizeFillColor(fill.fgColor || fill.bgColor);
+      const endColor = normalizeFillColor(fill.bgColor || fill.fgColor);
+      if (startColor && endColor) {
+        xml += '<gradientFill degree="90">';
+        xml += `<stop position="0"><color rgb="${startColor}"/></stop>`;
+        xml += `<stop position="1"><color rgb="${endColor}"/></stop>`;
+        xml += '</gradientFill>';
+      } else {
+        xml += '<patternFill patternType="none"/>';
+      }
     }
     xml += '</fill>';
 
@@ -275,25 +288,35 @@ export class StyleRegistry {
   }
 
   private buildDifferentialFill(fill: FillStyle): string {
-    if (fill.type !== 'pattern') return '';
-
     let xml = '<fill>';
     let hasContent = false;
-    xml += `<patternFill patternType="${escapeXML(fill.pattern || 'solid')}">`;
-    if (fill.fgColor) {
-      xml += `<fgColor rgb="FF${escapeXML(fill.fgColor)}"/>`;
-      hasContent = true;
+    if (fill.type === 'pattern') {
+      xml += `<patternFill patternType="${escapeXML(fill.pattern || 'solid')}">`;
+      if (fill.fgColor) {
+        xml += `<fgColor rgb="${normalizeFillColor(fill.fgColor)}"/>`;
+        hasContent = true;
+      }
+      if (fill.bgColor) {
+        xml += `<bgColor rgb="${normalizeFillColor(fill.bgColor)}"/>`;
+        hasContent = true;
+      } else if (fill.fgColor && fill.pattern === 'solid') {
+        xml += '<bgColor indexed="64"/>';
+        hasContent = true;
+      }
+      xml += '</patternFill>';
+      xml += '</fill>';
+      return hasContent || fill.pattern !== undefined ? xml : '';
     }
-    if (fill.bgColor) {
-      xml += `<bgColor rgb="FF${escapeXML(fill.bgColor)}"/>`;
-      hasContent = true;
-    } else if (fill.fgColor && fill.pattern === 'solid') {
-      xml += '<bgColor indexed="64"/>';
-      hasContent = true;
-    }
-    xml += '</patternFill>';
+
+    const startColor = normalizeFillColor(fill.fgColor || fill.bgColor);
+    const endColor = normalizeFillColor(fill.bgColor || fill.fgColor);
+    if (!startColor || !endColor) return '';
+    xml += '<gradientFill degree="90">';
+    xml += `<stop position="0"><color rgb="${startColor}"/></stop>`;
+    xml += `<stop position="1"><color rgb="${endColor}"/></stop>`;
+    xml += '</gradientFill>';
     xml += '</fill>';
-    return hasContent || fill.pattern !== undefined ? xml : '';
+    return xml;
   }
 
   private buildDifferentialBorder(border: BorderStyle): string {

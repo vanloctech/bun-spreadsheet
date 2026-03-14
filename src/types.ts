@@ -24,6 +24,13 @@ export interface FillStyle {
   bgColor?: string; // hex color
 }
 
+/** Split pane configuration */
+export interface SplitPane {
+  x: number;
+  y: number;
+  topLeftCell?: { row: number; col: number };
+}
+
 /** Border edge style */
 export interface BorderEdgeStyle {
   style?:
@@ -248,6 +255,7 @@ export interface Worksheet {
   dataValidations?: DataValidation[];
   conditionalFormattings?: ConditionalFormatting[];
   freezePane?: { row: number; col: number };
+  splitPane?: SplitPane;
   defaultRowHeight?: number;
   defaultColWidth?: number;
 }
@@ -289,6 +297,8 @@ export interface ExcelReadOptions {
 /** Excel write options */
 export interface ExcelWriteOptions {
   creator?: string;
+  created?: Date;
+  modified?: Date;
   compress?: boolean;
 }
 

@@ -99,6 +99,37 @@ describe('Excel Stream Writer', () => {
     expect(wb.worksheets[0].freezePane).toEqual({ row: 1, col: 0 });
   });
 
+  test('writes stream with split pane and workbook properties', async () => {
+    const path = `${TMP}/stream-split.xlsx`;
+    const created = new Date('2026-03-01T00:00:00.000Z');
+    const modified = new Date('2026-03-01T05:00:00.000Z');
+    const stream = createExcelStream(path, {
+      sheetName: 'Split',
+      creator: 'stream-writer',
+      created,
+      modified,
+      splitPane: {
+        x: 900,
+        y: 1600,
+        topLeftCell: { row: 1, col: 1 },
+      },
+    });
+
+    stream.writeRow(['Header']);
+    stream.writeRow(['Data']);
+    await stream.end();
+
+    const wb = await readExcel(path);
+    expect(wb.creator).toBe('stream-writer');
+    expect(wb.created?.toISOString()).toBe(created.toISOString());
+    expect(wb.modified?.toISOString()).toBe(modified.toISOString());
+    expect(wb.worksheets[0].splitPane).toEqual({
+      x: 900,
+      y: 1600,
+      topLeftCell: { row: 1, col: 1 },
+    });
+  });
+
   test('writes stream with merge cells', async () => {
     const path = `${TMP}/stream-merge.xlsx`;
     const stream = createExcelStream(path, {
@@ -276,6 +307,29 @@ describe('Chunked Stream Writer', () => {
 
     const wb = await readExcel(path);
     expect(wb.worksheets[0].freezePane).toEqual({ row: 1, col: 0 });
+  });
+
+  test('chunked stream with split pane', async () => {
+    const path = `${TMP}/chunked-split.xlsx`;
+    const stream = createChunkedExcelStream(path, {
+      sheetName: 'Split',
+      splitPane: {
+        x: 1440,
+        y: 2200,
+        topLeftCell: { row: 2, col: 1 },
+      },
+    });
+
+    stream.writeRow(['Header']);
+    stream.writeRow(['Data']);
+    await stream.end();
+
+    const wb = await readExcel(path);
+    expect(wb.worksheets[0].splitPane).toEqual({
+      x: 1440,
+      y: 2200,
+      topLeftCell: { row: 2, col: 1 },
+    });
   });
 
   test('chunked stream with data validation', async () => {
