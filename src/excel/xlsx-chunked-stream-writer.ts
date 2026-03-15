@@ -1,19 +1,18 @@
 // ============================================
-// XLSX Chunked Stream Writer — Constant-memory
-// streaming via temp file on disk
+// XLSX Chunked Stream Writer — Disk-backed
+// low-memory streaming
 // ============================================
 //
 // Flow:
-//   writeRow() → serialize XML → FileSink.write() to temp file (RAM: ~0)
-//   end()      → read temp file → assemble ZIP → write output → delete temp
+//   writeRow() → serialize XML → temp files on disk
+//   end()      → stream worksheet XML into ZIP entry → rename temp output
 //
 // Uses inline strings (<is><t>...</t></is>) instead of shared string table
-// to avoid tracking all strings in memory.
+// to avoid tracking all string values in memory.
 
-import { unlinkSync } from 'node:fs';
+import { renameSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { type Zippable, zipSync } from 'fflate';
+import { dirname, join, resolve } from 'node:path';
 import type {
   Cell,
   CellRange,
@@ -31,6 +30,7 @@ import type {
 import { buildAutoFilterXML } from './auto-filter';
 import { buildConditionalFormattingsXML } from './conditional-formatting';
 import { buildDataValidationsXML } from './data-validation';
+import { ManagedFileSink } from './file-sink';
 import { StyleRegistry } from './style-builder';
 import {
   buildAppPropsXML,
@@ -45,6 +45,7 @@ import {
   getFiniteNumber,
   getFiniteNumberOr,
 } from './xml-builder';
+import { StreamingZipWriter } from './zip-stream';
 
 /** Validate path for security */
 function validatePath(filePath: string): string {
@@ -78,46 +79,57 @@ export interface ChunkedExcelStreamOptions extends ExcelWriteOptions {
   dataValidations?: DataValidation[];
 }
 
-const encoder = new TextEncoder();
+function createTempFilePath(prefix: string): string {
+  return join(
+    tmpdir(),
+    `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,
+  );
+}
+
+function createOutputTempPath(outputPath: string): string {
+  return join(
+    dirname(outputPath),
+    `.bun-spreadsheet-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,
+  );
+}
 
 /**
- * Excel Chunked Stream Writer — Constant Memory
+ * Excel Chunked Stream Writer — Disk-backed low memory
  *
- * Writes row XML directly to a temporary file on disk via Bun's FileSink.
- * Row objects and XML strings are NOT kept in memory.
- * At end(), reads back the temp file and assembles the final ZIP.
+ * Writes row XML and hyperlink metadata directly to temporary files on disk.
+ * At end(), streams worksheet XML directly into a ZIP entry without
+ * materializing the full worksheet or archive in memory.
  *
  * Uses inline strings instead of shared string table to avoid
  * tracking all string values in memory.
- *
- * Memory usage stays ~constant regardless of how many rows are written.
  */
 export class ExcelChunkedStreamWriter implements StreamWriter {
-  private path: string;
-  private options: ChunkedExcelStreamOptions;
-  private styleRegistry = new StyleRegistry();
-  private tempFilePath: string;
-  private tempWriter: ReturnType<ReturnType<typeof Bun.file>['writer']>;
+  private readonly path: string;
+  private readonly options: ChunkedExcelStreamOptions;
+  private readonly styleRegistry = new StyleRegistry();
+  private readonly rowTempFilePath: string;
+  private readonly rowTempWriter: ManagedFileSink;
+  private readonly hyperlinkTempFilePath: string;
+  private readonly hyperlinkTempWriter: ManagedFileSink;
+  private readonly hyperlinkRelTempFilePath: string;
+  private readonly hyperlinkRelTempWriter: ManagedFileSink;
   private rowCount = 0;
-  private hyperlinkRels: { rId: string; target: string }[] = [];
-  private hyperlinkEntries: {
-    ref: string;
-    rId?: string;
-    location?: string;
-    tooltip?: string;
-  }[] = [];
+  private hyperlinkCount = 0;
+  private externalHyperlinkCount = 0;
   private hyperlinkRelCounter = 1;
+  private ended = false;
 
   constructor(path: string, options?: ChunkedExcelStreamOptions) {
     this.path = validatePath(path);
     this.options = options || {};
-
-    // Create temp file for row XML chunks
-    const tmpName = `bun-xlsx-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`;
-    this.tempFilePath = join(tmpdir(), tmpName);
-    this.tempWriter = Bun.file(this.tempFilePath).writer({
-      highWaterMark: 256 * 1024, // 256KB buffer
-    });
+    this.rowTempFilePath = createTempFilePath('bun-xlsx-rows');
+    this.rowTempWriter = new ManagedFileSink(this.rowTempFilePath);
+    this.hyperlinkTempFilePath = createTempFilePath('bun-xlsx-links');
+    this.hyperlinkTempWriter = new ManagedFileSink(this.hyperlinkTempFilePath);
+    this.hyperlinkRelTempFilePath = createTempFilePath('bun-xlsx-link-rels');
+    this.hyperlinkRelTempWriter = new ManagedFileSink(
+      this.hyperlinkRelTempFilePath,
+    );
   }
 
   /** Check if hyperlink target is external */
@@ -139,23 +151,10 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
     const styleIdx = this.styleRegistry.registerStyle(cellStyle);
     const { value } = cell;
 
-    // Collect hyperlinks
     if (cell.hyperlink) {
-      const hl = cell.hyperlink;
-      if (this.isExternalHyperlink(hl.target)) {
-        const rId = `rId${this.hyperlinkRelCounter++}`;
-        this.hyperlinkRels.push({ rId, target: hl.target });
-        this.hyperlinkEntries.push({ ref, rId, tooltip: hl.tooltip });
-      } else {
-        this.hyperlinkEntries.push({
-          ref,
-          location: hl.target,
-          tooltip: hl.tooltip,
-        });
-      }
+      this.writeHyperlink(ref, cell.hyperlink.target, cell.hyperlink.tooltip);
     }
 
-    // Formula cells
     if (cell.formula) {
       let xml = `<c r="${ref}"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}>`;
       xml += `<f>${escapeXML(cell.formula)}</f>`;
@@ -195,12 +194,105 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
     return '';
   }
 
+  private writeHyperlink(ref: string, target: string, tooltip?: string): void {
+    this.hyperlinkCount++;
+
+    let hyperlinkXml = `<hyperlink ref="${ref}"`;
+    if (tooltip) {
+      hyperlinkXml += ` tooltip="${escapeXML(tooltip)}"`;
+    }
+
+    if (this.isExternalHyperlink(target)) {
+      const rId = `rId${this.hyperlinkRelCounter++}`;
+      hyperlinkXml += ` r:id="${rId}"/>`;
+      this.hyperlinkTempWriter.write(hyperlinkXml);
+      this.hyperlinkRelTempWriter.write(
+        `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="${escapeXML(target)}" TargetMode="External"/>`,
+      );
+      this.externalHyperlinkCount++;
+      return;
+    }
+
+    hyperlinkXml += ` location="${escapeXML(target)}"/>`;
+    this.hyperlinkTempWriter.write(hyperlinkXml);
+  }
+
+  private ensureWritable(): void {
+    if (this.ended) {
+      throw new Error('Cannot write rows after stream.end() has been called');
+    }
+  }
+
+  private buildWorksheetPrefix(): string {
+    let xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+    xml +=
+      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
+
+    xml += buildSheetViewsXML({
+      freezePane: this.options.freezePane,
+      splitPane: this.options.splitPane,
+    });
+    xml += `<sheetFormatPr defaultRowHeight="${getFiniteNumberOr(this.options.defaultRowHeight, 15)}"/>`;
+
+    if (this.options.columns && this.options.columns.length > 0) {
+      xml += '<cols>';
+      for (let c = 0; c < this.options.columns.length; c++) {
+        const col = this.options.columns[c];
+        const colWidth = getFiniteNumber(col.width);
+        if (colWidth !== undefined) {
+          xml += `<col min="${c + 1}" max="${c + 1}" width="${colWidth}" customWidth="1"/>`;
+        }
+      }
+      xml += '</cols>';
+    }
+
+    xml += '<sheetData>';
+    return xml;
+  }
+
+  private buildWorksheetSuffix(): string[] {
+    const parts: string[] = ['</sheetData>'];
+
+    if (this.options.mergeCells && this.options.mergeCells.length > 0) {
+      parts.push(`<mergeCells count="${this.options.mergeCells.length}">`);
+      for (const mc of this.options.mergeCells) {
+        const startRef = buildCellRef(mc.startRow, mc.startCol);
+        const endRef = buildCellRef(mc.endRow, mc.endCol);
+        parts.push(`<mergeCell ref="${startRef}:${endRef}"/>`);
+      }
+      parts.push('</mergeCells>');
+    }
+
+    const autoFilterXml = buildAutoFilterXML(this.options.autoFilter);
+    if (autoFilterXml) {
+      parts.push(autoFilterXml);
+    }
+
+    const conditionalFormattingXml = buildConditionalFormattingsXML(
+      this.options.conditionalFormattings,
+      this.styleRegistry,
+    );
+    if (conditionalFormattingXml) {
+      parts.push(conditionalFormattingXml);
+    }
+
+    const dataValidationsXml = buildDataValidationsXML(
+      this.options.dataValidations,
+    );
+    if (dataValidationsXml) {
+      parts.push(dataValidationsXml);
+    }
+
+    parts.push('</worksheet>');
+    return parts;
+  }
+
   /**
-   * Write a single row — serializes XML and writes to temp file immediately.
-   * The Row object can be garbage collected right after this call.
-   * No row data is kept in memory.
+   * Write a single row — serializes XML and appends it to a temp file.
    */
   writeRow(row: Row | CellValue[]): void {
+    this.ensureWritable();
+
     const r = this.rowCount;
     this.rowCount++;
 
@@ -235,8 +327,7 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
 
     xml += '</row>';
 
-    // Write to temp file on disk — not kept in memory
-    this.tempWriter.write(xml);
+    this.rowTempWriter.write(xml);
   }
 
   /**
@@ -260,158 +351,108 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
   }
 
   /**
-   * Flush the temp file writer buffer to disk
+   * Flush temp file buffers to disk.
    */
-  flush(): void | Promise<void> {
-    const result = this.tempWriter.flush();
-    if (result instanceof Promise) {
-      return result.then(() => {});
-    }
+  flush(): Promise<void> {
+    return Promise.all([
+      this.rowTempWriter.flush(),
+      this.hyperlinkTempWriter.flush(),
+      this.hyperlinkRelTempWriter.flush(),
+    ]).then(() => {});
   }
 
   /**
-   * Finalize: read temp file, assemble worksheet XML, create ZIP, write output
+   * Finalize and write the XLSX file using incremental ZIP output.
    */
   async end(): Promise<void> {
-    // Flush and close the temp writer
-    await this.tempWriter.end();
-
-    const sheetName = this.options.sheetName || 'Sheet1';
-
-    // Build worksheet XML header
-    let wsHeader = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
-    wsHeader +=
-      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
-
-    wsHeader += buildSheetViewsXML({
-      freezePane: this.options.freezePane,
-      splitPane: this.options.splitPane,
-    });
-
-    // Sheet format
-    wsHeader += `<sheetFormatPr defaultRowHeight="${getFiniteNumberOr(this.options.defaultRowHeight, 15)}"/>`;
-
-    // Columns
-    if (this.options.columns && this.options.columns.length > 0) {
-      wsHeader += '<cols>';
-      for (let c = 0; c < this.options.columns.length; c++) {
-        const col = this.options.columns[c];
-        const colWidth = getFiniteNumber(col.width);
-        if (colWidth !== undefined) {
-          wsHeader += `<col min="${c + 1}" max="${c + 1}" width="${colWidth}" customWidth="1"/>`;
-        }
-      }
-      wsHeader += '</cols>';
+    if (this.ended) {
+      return;
     }
+    this.ended = true;
 
-    wsHeader += '<sheetData>';
+    const tempOutputPath = createOutputTempPath(this.path);
+    const tempPaths = [
+      this.rowTempFilePath,
+      this.hyperlinkTempFilePath,
+      this.hyperlinkRelTempFilePath,
+      tempOutputPath,
+    ];
 
-    // Read the row XML from temp file on disk
-    const tempFile = Bun.file(this.tempFilePath);
-    const rowXmlContent = await tempFile.text();
+    try {
+      await Promise.all([
+        this.rowTempWriter.end(),
+        this.hyperlinkTempWriter.end(),
+        this.hyperlinkRelTempWriter.end(),
+      ]);
 
-    // Build worksheet footer
-    let wsFooter = '</sheetData>';
+      const sheetName = this.options.sheetName || 'Sheet1';
+      const zipWriter = new StreamingZipWriter(tempOutputPath, {
+        compress: this.options.compress,
+      });
 
-    // Merge cells
-    if (this.options.mergeCells && this.options.mergeCells.length > 0) {
-      wsFooter += `<mergeCells count="${this.options.mergeCells.length}">`;
-      for (const mc of this.options.mergeCells) {
-        const startRef = buildCellRef(mc.startRow, mc.startCol);
-        const endRef = buildCellRef(mc.endRow, mc.endCol);
-        wsFooter += `<mergeCell ref="${startRef}:${endRef}"/>`;
-      }
-      wsFooter += '</mergeCells>';
-    }
-
-    const autoFilterXml = buildAutoFilterXML(this.options.autoFilter);
-    if (autoFilterXml) {
-      wsFooter += autoFilterXml;
-    }
-
-    const conditionalFormattingXml = buildConditionalFormattingsXML(
-      this.options.conditionalFormattings,
-      this.styleRegistry,
-    );
-    if (conditionalFormattingXml) {
-      wsFooter += conditionalFormattingXml;
-    }
-
-    const dataValidationsXml = buildDataValidationsXML(
-      this.options.dataValidations,
-    );
-    if (dataValidationsXml) {
-      wsFooter += dataValidationsXml;
-    }
-
-    // Hyperlinks
-    if (this.hyperlinkEntries.length > 0) {
-      wsFooter += '<hyperlinks>';
-      for (const hl of this.hyperlinkEntries) {
-        wsFooter += `<hyperlink ref="${hl.ref}"`;
-        if (hl.rId) wsFooter += ` r:id="${hl.rId}"`;
-        if (hl.location) wsFooter += ` location="${escapeXML(hl.location)}"`;
-        if (hl.tooltip) wsFooter += ` tooltip="${escapeXML(hl.tooltip)}"`;
-        wsFooter += '/>';
-      }
-      wsFooter += '</hyperlinks>';
-    }
-
-    wsFooter += '</worksheet>';
-
-    // Combine: header + rows from disk + footer
-    const fullWorksheetXml = wsHeader + rowXmlContent + wsFooter;
-
-    // Build ZIP (no shared strings file needed — using inline strings)
-    const files: Zippable = {
-      '[Content_Types].xml': encoder.encode(buildContentTypes(1)),
-      '_rels/.rels': encoder.encode(buildRootRels()),
-      'docProps/app.xml': encoder.encode(buildAppPropsXML([sheetName])),
-      'docProps/core.xml': encoder.encode(
+      await zipWriter.addFile('[Content_Types].xml', [buildContentTypes(1)]);
+      await zipWriter.addFile('_rels/.rels', [buildRootRels()]);
+      await zipWriter.addFile('docProps/app.xml', [
+        buildAppPropsXML([sheetName]),
+      ]);
+      await zipWriter.addFile('docProps/core.xml', [
         buildCorePropsXML({
           creator: this.options.creator,
           created: this.options.created,
           modified: this.options.modified,
         }),
-      ),
-      'xl/_rels/workbook.xml.rels': encoder.encode(buildWorkbookRels(1)),
-      'xl/workbook.xml': encoder.encode(buildWorkbookXML([sheetName])),
-      'xl/styles.xml': encoder.encode(this.styleRegistry.buildStylesXML()),
-      // Empty shared strings (required by some readers)
-      'xl/sharedStrings.xml': encoder.encode(
+      ]);
+      await zipWriter.addFile('xl/_rels/workbook.xml.rels', [
+        buildWorkbookRels(1),
+      ]);
+      await zipWriter.addFile('xl/workbook.xml', [
+        buildWorkbookXML([sheetName]),
+      ]);
+      await zipWriter.addFile('xl/styles.xml', [
+        this.styleRegistry.buildStylesXML(),
+      ]);
+      await zipWriter.addFile('xl/sharedStrings.xml', [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>',
-      ),
-      'xl/worksheets/sheet1.xml': encoder.encode(fullWorksheetXml),
-    };
+      ]);
 
-    // Hyperlink rels
-    if (this.hyperlinkRels.length > 0) {
-      let relsXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
-      relsXml +=
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
-      for (const rel of this.hyperlinkRels) {
-        relsXml += `<Relationship Id="${rel.rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="${escapeXML(rel.target)}" TargetMode="External"/>`;
+      const worksheetParts: (string | Blob)[] = [
+        this.buildWorksheetPrefix(),
+        Bun.file(this.rowTempFilePath),
+      ];
+
+      const worksheetSuffixParts = this.buildWorksheetSuffix();
+      if (this.hyperlinkCount > 0) {
+        const worksheetClosingTag = worksheetSuffixParts.pop();
+        if (worksheetClosingTag) {
+          worksheetParts.push(...worksheetSuffixParts, '<hyperlinks>');
+          worksheetParts.push(Bun.file(this.hyperlinkTempFilePath));
+          worksheetParts.push('</hyperlinks>', worksheetClosingTag);
+        }
+      } else {
+        worksheetParts.push(...worksheetSuffixParts);
       }
-      relsXml += '</Relationships>';
-      files['xl/worksheets/_rels/sheet1.xml.rels'] = encoder.encode(relsXml);
+
+      await zipWriter.addFile('xl/worksheets/sheet1.xml', worksheetParts);
+
+      if (this.externalHyperlinkCount > 0) {
+        await zipWriter.addFile('xl/worksheets/_rels/sheet1.xml.rels', [
+          '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+          Bun.file(this.hyperlinkRelTempFilePath),
+          '</Relationships>',
+        ]);
+      }
+
+      await zipWriter.close();
+      renameSync(tempOutputPath, this.path);
+    } finally {
+      for (const filePath of tempPaths) {
+        try {
+          unlinkSync(filePath);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
     }
-
-    const zipBuffer = zipSync(files, {
-      level: this.options.compress !== false ? 6 : 0,
-    });
-
-    await Bun.write(this.path, zipBuffer);
-
-    // Clean up temp file
-    try {
-      unlinkSync(this.tempFilePath);
-    } catch {
-      // Ignore cleanup errors
-    }
-
-    // Clear state
-    this.hyperlinkRels.length = 0;
-    this.hyperlinkEntries.length = 0;
   }
 
   /**
@@ -423,7 +464,7 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
 }
 
 /**
- * Create a chunked Excel stream writer (constant-memory disk-based streaming)
+ * Create a chunked Excel stream writer (disk-backed low-memory streaming)
  */
 export function createChunkedExcelStream(
   path: string,

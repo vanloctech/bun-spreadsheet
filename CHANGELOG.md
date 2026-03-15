@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Changed
+- Refactor `createChunkedExcelStream()` to stream worksheet XML and ZIP output incrementally instead of materializing the full worksheet/archive in memory at `end()`
+- Move chunked-writer hyperlink metadata to temp files and add internal temp/output flush management to reduce RAM growth during large exports
 
 ## [1.0.1] - 2026-03-14
 

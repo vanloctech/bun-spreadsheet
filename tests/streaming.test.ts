@@ -314,6 +314,44 @@ describe('Chunked Stream Writer', () => {
     expect(wb.worksheets[0].rows[0].cells[0].value).toBe('Bold');
   });
 
+  test('chunked stream writes hyperlinks without buffering them in memory', async () => {
+    const path = `${TMP}/chunked-hyperlinks.xlsx`;
+    const stream = createChunkedExcelStream(path, {
+      sheetName: 'Links',
+    });
+
+    stream.writeRow({
+      cells: [
+        {
+          value: 'External',
+          hyperlink: {
+            target: 'https://bun.sh',
+            tooltip: 'Bun website',
+          },
+        },
+        {
+          value: 'Internal',
+          hyperlink: {
+            target: 'Sheet1!A10',
+            tooltip: 'Jump inside sheet',
+          },
+        },
+      ],
+    });
+
+    await stream.end();
+
+    const wb = await readExcel(path);
+    expect(wb.worksheets[0].rows[0].cells[0].hyperlink).toEqual({
+      target: 'https://bun.sh',
+      tooltip: 'Bun website',
+    });
+    expect(wb.worksheets[0].rows[0].cells[1].hyperlink).toEqual({
+      target: 'Sheet1!A10',
+      tooltip: 'Jump inside sheet',
+    });
+  });
+
   test('chunked stream with freeze pane', async () => {
     const path = `${TMP}/chunked-freeze.xlsx`;
     const stream = createChunkedExcelStream(path, {
@@ -428,6 +466,24 @@ describe('Chunked Stream Writer', () => {
       expect(rule.color).toBe('5B9BD5');
       expect(rule.showValue).toBe(false);
     }
+  });
+
+  test('chunked stream supports uncompressed ZIP output', async () => {
+    const path = `${TMP}/chunked-store.xlsx`;
+    const stream = createChunkedExcelStream(path, {
+      sheetName: 'Stored',
+      compress: false,
+    });
+
+    for (let i = 0; i < 250; i++) {
+      stream.writeRow([i, `Row_${i}`]);
+    }
+
+    await stream.end();
+
+    const wb = await readExcel(path);
+    expect(wb.worksheets[0].rows).toHaveLength(250);
+    expect(wb.worksheets[0].rows[249].cells[1].value).toBe('Row_249');
   });
 
   test('chunked stream handles large data (5K rows)', async () => {

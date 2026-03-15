@@ -1,0 +1,101 @@
+import { Buffer } from 'node:buffer';
+
+type SinkChunk = Parameters<Bun.FileSink['write']>[0];
+
+function getChunkSize(chunk: SinkChunk): number {
+  if (typeof chunk === 'string') {
+    return Buffer.byteLength(chunk);
+  }
+
+  if (chunk instanceof ArrayBuffer || chunk instanceof SharedArrayBuffer) {
+    return chunk.byteLength;
+  }
+
+  if (ArrayBuffer.isView(chunk)) {
+    return chunk.byteLength;
+  }
+
+  return 0;
+}
+
+export interface ManagedFileSinkOptions {
+  highWaterMark?: number;
+  flushThreshold?: number;
+}
+
+export class ManagedFileSink {
+  private readonly sink: Bun.FileSink;
+  private readonly flushThreshold: number;
+  private bufferedBytes = 0;
+  private flushQueued = false;
+  private flushPromise: Promise<void> = Promise.resolve();
+  private closed = false;
+
+  constructor(path: string, options: ManagedFileSinkOptions = {}) {
+    this.sink = Bun.file(path).writer({
+      highWaterMark: options.highWaterMark ?? 256 * 1024,
+    });
+    this.flushThreshold = options.flushThreshold ?? 512 * 1024;
+  }
+
+  write(chunk: SinkChunk): void {
+    if (this.closed) {
+      throw new Error('Cannot write to a closed file sink');
+    }
+
+    this.sink.write(chunk);
+    this.bufferedBytes += getChunkSize(chunk);
+
+    if (this.bufferedBytes >= this.flushThreshold) {
+      this.queueFlush();
+    }
+  }
+
+  drain(): Promise<void> {
+    return this.flushPromise;
+  }
+
+  async flush(): Promise<void> {
+    if (this.bufferedBytes > 0) {
+      this.queueFlush();
+    }
+    await this.flushPromise;
+  }
+
+  async end(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+
+    await this.flush();
+    this.closed = true;
+
+    const result = this.sink.end();
+    if (result instanceof Promise) {
+      await result;
+    }
+  }
+
+  private queueFlush(): void {
+    if (this.flushQueued || this.closed) {
+      return;
+    }
+
+    this.flushQueued = true;
+    this.bufferedBytes = 0;
+
+    this.flushPromise = this.flushPromise
+      .then(async () => {
+        const result = this.sink.flush();
+        if (result instanceof Promise) {
+          await result;
+        }
+      })
+      .finally(() => {
+        this.flushQueued = false;
+        if (this.bufferedBytes >= this.flushThreshold && !this.closed) {
+          this.queueFlush();
+        }
+      });
+  }
+}
