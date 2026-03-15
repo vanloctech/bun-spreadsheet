@@ -10,7 +10,7 @@
 // Uses inline strings (<is><t>...</t></is>) instead of shared string table
 // to avoid tracking all string values in memory.
 
-import { renameSync, unlinkSync } from 'node:fs';
+import { renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type {
@@ -408,9 +408,6 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
       await zipWriter.addFile('xl/workbook.xml', [
         buildWorkbookXML([sheetName]),
       ]);
-      await zipWriter.addFile('xl/styles.xml', [
-        this.styleRegistry.buildStylesXML(),
-      ]);
       await zipWriter.addFile('xl/sharedStrings.xml', [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>',
       ]);
@@ -433,6 +430,9 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
       }
 
       await zipWriter.addFile('xl/worksheets/sheet1.xml', worksheetParts);
+      await zipWriter.addFile('xl/styles.xml', [
+        this.styleRegistry.buildStylesXML(),
+      ]);
 
       if (this.externalHyperlinkCount > 0) {
         await zipWriter.addFile('xl/worksheets/_rels/sheet1.xml.rels', [
@@ -445,13 +445,15 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
       await zipWriter.close();
       renameSync(tempOutputPath, this.path);
     } finally {
-      for (const filePath of tempPaths) {
-        try {
-          unlinkSync(filePath);
-        } catch {
-          // Ignore cleanup errors
-        }
-      }
+      await Promise.all(
+        tempPaths.map(async (filePath) => {
+          try {
+            await Bun.file(filePath).delete();
+          } catch {
+            // Ignore cleanup errors
+          }
+        }),
+      );
     }
   }
 

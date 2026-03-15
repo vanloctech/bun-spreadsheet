@@ -82,8 +82,8 @@ export async function readExcel(
     throw new Error(`File not found: ${resolvedPath}`);
   }
 
-  // Read as ArrayBuffer and unzip with pre-decompression size check
-  const buffer = await file.arrayBuffer();
+  // Read bytes directly as Uint8Array for unzipSync()
+  const buffer = await file.bytes();
   if (buffer.byteLength > MAX_FILE_SIZE) {
     throw new Error(
       `File too large: ${buffer.byteLength} bytes (max: ${MAX_FILE_SIZE})`,
@@ -95,7 +95,7 @@ export async function readExcel(
   // before it is decompressed, so we can reject without allocating memory.
   let totalDeclaredSize = 0;
   let entryCount = 0;
-  const zip = unzipSync(new Uint8Array(buffer), {
+  const zip = unzipSync(buffer, {
     filter(file) {
       entryCount++;
       if (entryCount > MAX_ZIP_ENTRIES) {
