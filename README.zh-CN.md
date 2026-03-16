@@ -107,7 +107,17 @@ const csv = await readCSV("data.csv");
 bun run benchmark:1m
 ```
 
-如果你想看普通写入、流式写入和分块磁盘写入三种模式的小规模对比，可以运行：
+如果你想看普通写入、流式写入和分块磁盘写入三种模式在真实 `large-report` 工作负载下的对比，下面这组数据是在 Bun `1.3.10` / `MacOS ARM`、单工作表、压缩 `.xlsx`、`30` 列 x `30,000` 行，并使用与 [`examples/large-report.ts`](/Users/locnguyen/Sharegether/locne/bun-spreadsheet/examples/large-report.ts) 相同的样式、合并单元格和页脚公式的条件下测得：
+
+| 方法 | 总耗时 | Peak RSS 增量 | Peak heapUsed 增量 | 文件大小 |
+| --- | ---: | ---: | ---: | ---: |
+| `writeExcel()` | `1.92s` | `518.6MB` | `154.0MB` | `6.20MB` |
+| `createExcelStream()` | `1.98s` | `48.0MB` | `39.2MB` | `6.35MB` |
+| `createChunkedExcelStream()` | `2.01s` | `2.5MB` | `3.1MB` | `6.35MB` |
+
+这里的内存列表示 benchmark 运行过程中相对基线进程内存的峰值增量，不是写入前后内存差值。
+
+你可以通过下面的命令在自己的机器上重跑这个 benchmark：
 
 ```bash
 bun run benchmark

@@ -1,94 +1,73 @@
 // ============================================
-// Benchmark: Normal vs Stream vs Chunked Stream
+// Benchmark: realistic large-report workload
 // 30 columns x 30,000 rows
 // ============================================
 
+import { mkdirSync } from 'node:fs';
 import {
-  type Cell,
-  type CellStyle,
-  type ColumnConfig,
   createChunkedExcelStream,
   createExcelStream,
-  type Row,
   writeExcel,
 } from '../src/index';
-
-const DATA_ROWS = 30_000;
-const COL_COUNT = 30;
-
-const numStyle: CellStyle = {
-  numberFormat: '#,##0.00',
-  alignment: { horizontal: 'right' },
-};
-const hdrStyle: CellStyle = {
-  font: { bold: true, color: 'FFFFFF' },
-  fill: { type: 'pattern', pattern: 'solid', fgColor: '2F5496' },
-  alignment: { horizontal: 'center' },
-};
-
-const cols: ColumnConfig[] = Array.from({ length: COL_COUNT }, () => ({
-  width: 14,
-}));
-
-function nowMs(): number {
-  return Bun.nanoseconds() / 1_000_000;
-}
-
-function colLetter(i: number) {
-  let s = '';
-  let n = i;
-  while (n >= 0) {
-    s = String.fromCharCode(65 + (n % 26)) + s;
-    n = Math.floor(n / 26) - 1;
-  }
-  return s;
-}
-
-function makeCell(c: number, i: number): Cell {
-  if (c === 0) return { value: i + 1 };
-  if (c < 7) return { value: `val_${i}_${c}` };
-  return {
-    value: Math.round(Math.random() * 50000 * 100) / 100,
-    style: numStyle,
-  };
-}
-
-const headerCells: Cell[] = Array.from({ length: COL_COUNT }, (_, i) => ({
-  value: `Col${i}`,
-  style: hdrStyle,
-}));
-
-function makeFormulaRow(
-  fn: string,
-  lastRow: number,
-): { cells: Cell[]; height: number } {
-  const fc: Cell[] = [{ value: fn, style: hdrStyle }];
-  for (let c = 1; c < 7; c++) fc.push({ value: null });
-  for (let c = 7; c < COL_COUNT; c++)
-    fc.push({
-      value: null,
-      formula: `${fn}(${colLetter(c)}5:${colLetter(c)}${lastRow})`,
-    });
-  return { cells: fc, height: 30 };
-}
+import {
+  buildLargeReportWorkbook,
+  createLargeReportDataRow,
+  createLargeReportFooterRows,
+  createLargeReportMergeCells,
+  createLargeReportPreludeRows,
+  LARGE_REPORT_COL_COUNT,
+  LARGE_REPORT_DATA_ROWS,
+  LARGE_REPORT_FREEZE_PANE,
+  LARGE_REPORT_SHEET_NAME,
+  largeReportColumns,
+} from './large-report-workload';
 
 interface Result {
   genMs: number;
   writeMs: number;
   totalMs: number;
-  rss: number;
-  heap: number;
+  peakRss: number;
+  peakHeapUsed: number;
   fileSize: number;
+}
+
+interface PeakTracker {
+  baselineRss: number;
+  baselineHeapUsed: number;
+  peakRss: number;
+  peakHeapUsed: number;
+}
+
+function nowMs(): number {
+  return Bun.nanoseconds() / 1_000_000;
+}
+
+function createPeakTracker(): PeakTracker {
+  const mem = process.memoryUsage();
+  return {
+    baselineRss: mem.rss,
+    baselineHeapUsed: mem.heapUsed,
+    peakRss: mem.rss,
+    peakHeapUsed: mem.heapUsed,
+  };
+}
+
+function samplePeak(tracker: PeakTracker) {
+  const mem = process.memoryUsage();
+  if (mem.rss > tracker.peakRss) tracker.peakRss = mem.rss;
+  if (mem.heapUsed > tracker.peakHeapUsed) tracker.peakHeapUsed = mem.heapUsed;
+}
+
+function peakDeltaMb(peak: number, baseline: number): number {
+  return (peak - baseline) / 1024 / 1024;
 }
 
 const OUTPUT = './output';
 
-import { mkdirSync } from 'node:fs';
-
 mkdirSync(OUTPUT, { recursive: true });
 
 console.log(
-  `Benchmark: ${COL_COUNT} columns x ${DATA_ROWS.toLocaleString()} rows`,
+  `Benchmark: large-report workload (${LARGE_REPORT_COL_COUNT} columns x ${LARGE_REPORT_DATA_ROWS.toLocaleString()} rows)`,
 );
 console.log('='.repeat(60));
 
@@ -98,101 +77,79 @@ console.log('\n[1/3] Normal write (writeExcel)');
 Bun.gc(true);
 await Bun.sleep(200);
 
-const m1b = process.memoryUsage();
+const p1 = createPeakTracker();
 const t1s = nowMs();
-
-const rows: Row[] = [];
-rows.push({ cells: [{ value: 'REPORT' }] });
-rows.push({ cells: [{ value: 'Subtitle' }] });
-rows.push({ cells: [] });
-rows.push({ cells: headerCells });
-
 const t1g = nowMs();
-for (let i = 0; i < DATA_ROWS; i++) {
-  const cells: Cell[] = [];
-  for (let c = 0; c < COL_COUNT; c++) cells.push(makeCell(c, i));
-  rows.push({ cells });
-}
+const normalWorkbook = buildLargeReportWorkbook();
+samplePeak(p1);
 const t1gd = nowMs();
-for (const fn of ['SUM', 'AVERAGE', 'MAX', 'MIN'])
-  rows.push(makeFormulaRow(fn, DATA_ROWS + 4));
 
 const t1w = nowMs();
-await writeExcel(`${OUTPUT}/bench-normal.xlsx`, {
-  worksheets: [
-    {
-      name: 'Report',
-      rows,
-      columns: cols,
-      freezePane: { row: 4, col: 1 },
-    },
-  ],
-});
+await writeExcel(`${OUTPUT}/bench-normal.xlsx`, normalWorkbook);
 const t1d = nowMs();
-const m1a = process.memoryUsage();
+samplePeak(p1);
 const f1 = Bun.file(`${OUTPUT}/bench-normal.xlsx`);
 
 const r1: Result = {
   genMs: t1gd - t1g,
   writeMs: t1d - t1w,
   totalMs: t1d - t1s,
-  rss: (m1a.rss - m1b.rss) / 1024 / 1024,
-  heap: (m1a.heapUsed - m1b.heapUsed) / 1024 / 1024,
+  peakRss: peakDeltaMb(p1.peakRss, p1.baselineRss),
+  peakHeapUsed: peakDeltaMb(p1.peakHeapUsed, p1.baselineHeapUsed),
   fileSize: f1.size / 1024 / 1024,
 };
 console.log(
   `      Gen: ${r1.genMs.toFixed(0)}ms | Write: ${r1.writeMs.toFixed(0)}ms | Total: ${r1.totalMs.toFixed(0)}ms`,
 );
 console.log(
-  `      RSS: +${r1.rss.toFixed(1)}MB | Heap: +${r1.heap.toFixed(1)}MB | File: ${r1.fileSize.toFixed(2)}MB`,
+  `      Peak RSS delta: +${r1.peakRss.toFixed(1)}MB | Peak heapUsed delta: +${r1.peakHeapUsed.toFixed(1)}MB | File: ${r1.fileSize.toFixed(2)}MB`,
 );
 
 // --- 2. Stream Write ---------------------------------------------------------
-rows.length = 0;
 Bun.gc(true);
 await Bun.sleep(500);
 
 console.log('\n[2/3] Stream write (createExcelStream)');
 
-const m2b = process.memoryUsage();
+const p2 = createPeakTracker();
 const t2s = nowMs();
 
 const stream = createExcelStream(`${OUTPUT}/bench-stream.xlsx`, {
-  sheetName: 'Report',
-  columns: cols,
-  freezePane: { row: 1, col: 1 },
+  sheetName: LARGE_REPORT_SHEET_NAME,
+  columns: largeReportColumns,
+  freezePane: LARGE_REPORT_FREEZE_PANE,
+  mergeCells: createLargeReportMergeCells(),
 });
-stream.writeRow({ cells: headerCells, height: 30 });
 
 const t2g = nowMs();
-for (let i = 0; i < DATA_ROWS; i++) {
-  const cells: Cell[] = [];
-  for (let c = 0; c < COL_COUNT; c++) cells.push(makeCell(c, i));
-  stream.writeRow({ cells });
+for (const row of createLargeReportPreludeRows()) stream.writeRow(row);
+for (let i = 0; i < LARGE_REPORT_DATA_ROWS; i++) {
+  stream.writeRow(createLargeReportDataRow(i));
+  if ((i + 1) % 250 === 0) samplePeak(p2);
 }
+for (const row of createLargeReportFooterRows()) stream.writeRow(row);
+samplePeak(p2);
 const t2gd = nowMs();
-for (const fn of ['SUM', 'AVERAGE', 'MAX', 'MIN'])
-  stream.writeRow(makeFormulaRow(fn, DATA_ROWS + 1));
 
 const t2w = nowMs();
 await stream.end();
 const t2d = nowMs();
-const m2a = process.memoryUsage();
+samplePeak(p2);
 const f2 = Bun.file(`${OUTPUT}/bench-stream.xlsx`);
 
 const r2: Result = {
   genMs: t2gd - t2g,
   writeMs: t2d - t2w,
   totalMs: t2d - t2s,
-  rss: (m2a.rss - m2b.rss) / 1024 / 1024,
-  heap: (m2a.heapUsed - m2b.heapUsed) / 1024 / 1024,
+  peakRss: peakDeltaMb(p2.peakRss, p2.baselineRss),
+  peakHeapUsed: peakDeltaMb(p2.peakHeapUsed, p2.baselineHeapUsed),
   fileSize: f2.size / 1024 / 1024,
 };
 console.log(
   `      Gen: ${r2.genMs.toFixed(0)}ms | Write: ${r2.writeMs.toFixed(0)}ms | Total: ${r2.totalMs.toFixed(0)}ms`,
 );
 console.log(
-  `      RSS: +${r2.rss.toFixed(1)}MB | Heap: +${r2.heap.toFixed(1)}MB | File: ${r2.fileSize.toFixed(2)}MB`,
+  `      Peak RSS delta: +${r2.peakRss.toFixed(1)}MB | Peak heapUsed delta: +${r2.peakHeapUsed.toFixed(1)}MB | File: ${r2.fileSize.toFixed(2)}MB`,
 );
 
 // --- 3. Chunked Stream Write -------------------------------------------------
@@ -201,45 +158,45 @@ await Bun.sleep(500);
 
 console.log('\n[3/3] Chunked stream write (createChunkedExcelStream)');
 
-const m3b = process.memoryUsage();
+const p3 = createPeakTracker();
 const t3s = nowMs();
 
 const chunked = createChunkedExcelStream(`${OUTPUT}/bench-chunked.xlsx`, {
-  sheetName: 'Report',
-  columns: cols,
-  freezePane: { row: 1, col: 1 },
+  sheetName: LARGE_REPORT_SHEET_NAME,
+  columns: largeReportColumns,
+  freezePane: LARGE_REPORT_FREEZE_PANE,
+  mergeCells: createLargeReportMergeCells(),
 });
-chunked.writeRow({ cells: headerCells, height: 30 });
 
 const t3g = nowMs();
-for (let i = 0; i < DATA_ROWS; i++) {
-  const cells: Cell[] = [];
-  for (let c = 0; c < COL_COUNT; c++) cells.push(makeCell(c, i));
-  chunked.writeRow({ cells });
+for (const row of createLargeReportPreludeRows()) chunked.writeRow(row);
+for (let i = 0; i < LARGE_REPORT_DATA_ROWS; i++) {
+  chunked.writeRow(createLargeReportDataRow(i));
+  if ((i + 1) % 250 === 0) samplePeak(p3);
 }
+for (const row of createLargeReportFooterRows()) chunked.writeRow(row);
+samplePeak(p3);
 const t3gd = nowMs();
-for (const fn of ['SUM', 'AVERAGE', 'MAX', 'MIN'])
-  chunked.writeRow(makeFormulaRow(fn, DATA_ROWS + 1));
 
 const t3w = nowMs();
 await chunked.end();
 const t3d = nowMs();
-const m3a = process.memoryUsage();
+samplePeak(p3);
 const f3 = Bun.file(`${OUTPUT}/bench-chunked.xlsx`);
 
 const r3: Result = {
   genMs: t3gd - t3g,
   writeMs: t3d - t3w,
   totalMs: t3d - t3s,
-  rss: (m3a.rss - m3b.rss) / 1024 / 1024,
-  heap: (m3a.heapUsed - m3b.heapUsed) / 1024 / 1024,
+  peakRss: peakDeltaMb(p3.peakRss, p3.baselineRss),
+  peakHeapUsed: peakDeltaMb(p3.peakHeapUsed, p3.baselineHeapUsed),
   fileSize: f3.size / 1024 / 1024,
 };
 console.log(
   `      Gen: ${r3.genMs.toFixed(0)}ms | Write: ${r3.writeMs.toFixed(0)}ms | Total: ${r3.totalMs.toFixed(0)}ms`,
 );
 console.log(
-  `      RSS: +${r3.rss.toFixed(1)}MB | Heap: +${r3.heap.toFixed(1)}MB | File: ${r3.fileSize.toFixed(2)}MB`,
+  `      Peak RSS delta: +${r3.peakRss.toFixed(1)}MB | Peak heapUsed delta: +${r3.peakHeapUsed.toFixed(1)}MB | File: ${r3.fileSize.toFixed(2)}MB`,
 );
 
 // --- Comparison Table --------------------------------------------------------
@@ -256,10 +213,10 @@ console.log(
   `  Total:      ${String(r1.totalMs.toFixed(0)).padStart(8)}ms  ${String(r2.totalMs.toFixed(0)).padStart(8)}ms  ${String(r3.totalMs.toFixed(0)).padStart(8)}ms`,
 );
 console.log(
-  `  RSS delta:  ${String(r1.rss.toFixed(1)).padStart(7)}MB   ${String(r2.rss.toFixed(1)).padStart(7)}MB   ${String(r3.rss.toFixed(1)).padStart(7)}MB`,
+  `  Peak RSS Δ: ${String(r1.peakRss.toFixed(1)).padStart(7)}MB   ${String(r2.peakRss.toFixed(1)).padStart(7)}MB   ${String(r3.peakRss.toFixed(1)).padStart(7)}MB`,
 );
 console.log(
-  `  Heap delta: ${String(r1.heap.toFixed(1)).padStart(7)}MB   ${String(r2.heap.toFixed(1)).padStart(7)}MB   ${String(r3.heap.toFixed(1)).padStart(7)}MB`,
+  `  Peak heap Δ:${String(r1.peakHeapUsed.toFixed(1)).padStart(8)}MB   ${String(r2.peakHeapUsed.toFixed(1)).padStart(7)}MB   ${String(r3.peakHeapUsed.toFixed(1)).padStart(7)}MB`,
 );
 console.log(
   `  File size:  ${String(r1.fileSize.toFixed(2)).padStart(7)}MB   ${String(r2.fileSize.toFixed(2)).padStart(7)}MB   ${String(r3.fileSize.toFixed(2)).padStart(7)}MB`,

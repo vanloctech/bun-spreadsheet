@@ -107,7 +107,17 @@ Measured on Bun `1.3.10` / `MacOS ARM` with a single worksheet, compressed `.xls
 bun run benchmark:1m
 ```
 
-For the smaller comparison benchmark across normal, streaming, and chunked modes, run:
+For the realistic `large-report` workload benchmark across normal, streaming, and chunked modes, measured on Bun `1.3.10` / `MacOS ARM` with a single worksheet, compressed `.xlsx`, and `30` columns x `30,000` rows using the same styles, merge cells, and footer formulas as [`examples/large-report.ts`](/Users/locnguyen/Sharegether/locne/bun-spreadsheet/examples/large-report.ts):
+
+| Method | Total time | Peak RSS delta | Peak heapUsed delta | File size |
+| --- | ---: | ---: | ---: | ---: |
+| `writeExcel()` | `1.92s` | `518.6MB` | `154.0MB` | `6.20MB` |
+| `createExcelStream()` | `1.98s` | `48.0MB` | `39.2MB` | `6.35MB` |
+| `createChunkedExcelStream()` | `2.01s` | `2.5MB` | `3.1MB` | `6.35MB` |
+
+These memory columns are peak deltas over the baseline process memory during the benchmark, not just the memory difference before and after the write.
+
+Re-run this benchmark on your machine with:
 
 ```bash
 bun run benchmark
