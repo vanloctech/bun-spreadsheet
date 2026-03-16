@@ -15,18 +15,22 @@ import type {
   ColumnConfig,
   ConditionalFormatting,
   DataValidation,
+  DefinedName,
   ExcelWriteOptions,
   FileTarget,
   MergeCell,
   Row,
   StreamWriter,
+  WorkbookView,
   Worksheet,
 } from '../types';
 import { buildAutoFilterXML } from './auto-filter';
+import { type CommentEntry, commentRefFromCoords } from './comments';
 import { buildConditionalFormattingsXML } from './conditional-formatting';
 import { buildDataValidationsXML } from './data-validation';
 import { ManagedFileSink } from './file-sink';
 import { createTempRuntimeId } from './runtime-utils';
+import { buildWorksheetFeatureArtifacts } from './sheet-parts';
 import { StyleRegistry } from './style-builder';
 import { ExcelChunkedStreamWriter } from './xlsx-chunked-stream-writer';
 import {
@@ -34,7 +38,13 @@ import {
   buildCellRef,
   buildContentTypes,
   buildCorePropsXML,
+  buildHeaderFooterXML,
+  buildPageMarginsXML,
+  buildPageSetupXML,
+  buildRichTextXML,
   buildRootRels,
+  buildSheetPropertiesXML,
+  buildSheetProtectionXML,
   buildSheetViewsXML,
   buildWorkbookRels,
   buildWorkbookXML,
@@ -43,6 +53,8 @@ import {
   getFiniteNumberOr,
 } from './xml-builder';
 import { StreamingZipWriter } from './zip-stream';
+
+const CELL_REF_PARTS_REGEX = /^([A-Z]+)(\d+)$/;
 
 /**
  * Options for the Excel stream writer
@@ -66,6 +78,26 @@ export interface ExcelStreamOptions extends ExcelWriteOptions {
   conditionalFormattings?: ConditionalFormatting[];
   /** Data validation rules */
   dataValidations?: DataValidation[];
+  /** Worksheet state */
+  state?: Worksheet['state'];
+  /** Sheet protection */
+  protection?: Worksheet['protection'];
+  /** Page margins */
+  pageMargins?: Worksheet['pageMargins'];
+  /** Page setup */
+  pageSetup?: Worksheet['pageSetup'];
+  /** Header/footer */
+  headerFooter?: Worksheet['headerFooter'];
+  /** Print area */
+  printArea?: Worksheet['printArea'];
+  /** Worksheet images */
+  images?: Worksheet['images'];
+  /** Worksheet tables */
+  tables?: Worksheet['tables'];
+  /** Workbook defined names */
+  definedNames?: DefinedName[];
+  /** Workbook views */
+  views?: WorkbookView;
 }
 
 function createTempFilePath(prefix: string): string {
@@ -77,6 +109,17 @@ function createOutputTempPath(outputPath: string): string {
     dirname(outputPath),
     `.bun-spreadsheet-${createTempRuntimeId()}.tmp`,
   );
+}
+
+function quoteSheetName(name: string): string {
+  return `'${name.replace(/'/g, "''")}'`;
+}
+
+function absoluteCellRef(row: number, col: number): string {
+  const ref = buildCellRef(row, col);
+  const match = ref.match(CELL_REF_PARTS_REGEX);
+  if (!match) return ref;
+  return `$${match[1]}$${match[2]}`;
 }
 
 class DiskBackedWorksheetWriter {
@@ -92,6 +135,8 @@ class DiskBackedWorksheetWriter {
   private hyperlinkCount = 0;
   private externalHyperlinkCount = 0;
   private hyperlinkRelCounter = 1;
+  private hasOutlineLevels = false;
+  private readonly commentEntries: CommentEntry[] = [];
   private closed = false;
 
   constructor(options: ExcelStreamOptions, styleRegistry: StyleRegistry) {
@@ -171,6 +216,12 @@ class DiskBackedWorksheetWriter {
       return styleIdx > 0 ? `<c r="${ref}" s="${styleIdx}"/>` : '';
     }
 
+    if (cell.richText && cell.richText.length > 0) {
+      return `<c r="${ref}" t="inlineStr"${
+        styleIdx > 0 ? ` s="${styleIdx}"` : ''
+      }>${buildRichTextXML(cell.richText)}</c>`;
+    }
+
     if (typeof value === 'string') {
       return `<c r="${ref}" t="inlineStr"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}><is><t>${escapeXML(value)}</t></is></c>`;
     }
@@ -194,6 +245,10 @@ class DiskBackedWorksheetWriter {
     let xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
     xml +=
       '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
+    xml += buildSheetPropertiesXML(
+      this.hasOutlineLevels ||
+        !!this.options.columns?.some((column) => !!column.outlineLevel),
+    );
     xml += buildSheetViewsXML({
       freezePane: this.options.freezePane,
       splitPane: this.options.splitPane,
@@ -205,9 +260,16 @@ class DiskBackedWorksheetWriter {
       for (let c = 0; c < this.options.columns.length; c++) {
         const col = this.options.columns[c];
         const colWidth = getFiniteNumber(col.width);
+        let colAttrs = ` min="${c + 1}" max="${c + 1}"`;
         if (colWidth !== undefined) {
-          xml += `<col min="${c + 1}" max="${c + 1}" width="${colWidth}" customWidth="1"/>`;
+          colAttrs += ` width="${colWidth}" customWidth="1"`;
         }
+        if (col.hidden) colAttrs += ' hidden="1"';
+        if (col.collapsed) colAttrs += ' collapsed="1"';
+        if (col.outlineLevel !== undefined) {
+          colAttrs += ` outlineLevel="${Math.max(0, Math.trunc(col.outlineLevel))}"`;
+        }
+        xml += `<col${colAttrs}/>`;
       }
       xml += '</cols>';
     }
@@ -249,6 +311,26 @@ class DiskBackedWorksheetWriter {
       parts.push(dataValidationsXml);
     }
 
+    const protectionXml = buildSheetProtectionXML(this.options.protection);
+    if (protectionXml) {
+      parts.push(protectionXml);
+    }
+
+    const pageMarginsXml = buildPageMarginsXML(this.options.pageMargins);
+    if (pageMarginsXml) {
+      parts.push(pageMarginsXml);
+    }
+
+    const pageSetupXml = buildPageSetupXML(this.options.pageSetup);
+    if (pageSetupXml) {
+      parts.push(pageSetupXml);
+    }
+
+    const headerFooterXml = buildHeaderFooterXML(this.options.headerFooter);
+    if (headerFooterXml) {
+      parts.push(headerFooterXml);
+    }
+
     parts.push('</worksheet>');
     return parts;
   }
@@ -269,6 +351,12 @@ class DiskBackedWorksheetWriter {
     if (rowHeight !== undefined) {
       rowAttrs += ` ht="${rowHeight}" customHeight="1"`;
     }
+    if (rowObj.hidden) rowAttrs += ' hidden="1"';
+    if (rowObj.collapsed) rowAttrs += ' collapsed="1"';
+    if (rowObj.outlineLevel !== undefined) {
+      rowAttrs += ` outlineLevel="${Math.max(0, Math.trunc(rowObj.outlineLevel))}"`;
+      this.hasOutlineLevels = true;
+    }
 
     const rowStyleIdx = rowObj.style
       ? this.styleRegistry.registerStyle(rowObj.style)
@@ -283,6 +371,12 @@ class DiskBackedWorksheetWriter {
       const cell = rowObj.cells[c];
       if (!cell) continue;
       const ref = buildCellRef(r, c);
+      if (cell.comment) {
+        this.commentEntries.push({
+          ref: commentRefFromCoords(r, c),
+          comment: cell.comment,
+        });
+      }
       xml += this.serializeCell(cell, ref, rowObj.style);
     }
 
@@ -324,12 +418,44 @@ class DiskBackedWorksheetWriter {
     ]);
   }
 
-  buildWorksheetParts(): (string | Blob)[] {
+  buildFeatureArtifacts(
+    sheetIndex: number,
+    counters: {
+      nextCommentsIndex: number;
+      nextDrawingIndex: number;
+      nextTableIndex: number;
+    },
+  ) {
+    return buildWorksheetFeatureArtifacts(
+      {
+        name: this.options.sheetName || `Sheet${sheetIndex}`,
+        rows: [],
+        images: this.options.images,
+        tables: this.options.tables,
+      },
+      counters,
+      {
+        commentEntries: this.commentEntries,
+        startingRelIndex: this.hyperlinkRelCounter,
+      },
+    );
+  }
+
+  buildWorksheetParts(featureArtifacts?: {
+    xmlPartsBeforeClose: string[];
+  }): (string | Blob)[] {
     const parts: (string | Blob)[] = [
       this.buildWorksheetPrefix(),
       Bun.file(this.rowTempFilePath),
     ];
     const suffixParts = this.buildWorksheetSuffix();
+    if (featureArtifacts?.xmlPartsBeforeClose?.length) {
+      suffixParts.splice(
+        suffixParts.length - 1,
+        0,
+        ...featureArtifacts.xmlPartsBeforeClose,
+      );
+    }
 
     if (this.hyperlinkCount > 0) {
       const closingTag = suffixParts.pop();
@@ -345,16 +471,25 @@ class DiskBackedWorksheetWriter {
     return parts;
   }
 
-  buildWorksheetRelParts(): (string | Blob)[] | undefined {
-    if (this.externalHyperlinkCount === 0) {
+  buildWorksheetRelParts(
+    featureRelationships: string[] = [],
+  ): (string | Blob)[] | undefined {
+    if (
+      this.externalHyperlinkCount === 0 &&
+      featureRelationships.length === 0
+    ) {
       return undefined;
     }
 
-    return [
+    const parts: (string | Blob)[] = [
       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
-      Bun.file(this.hyperlinkRelTempFilePath),
-      '</Relationships>',
+      ...featureRelationships,
     ];
+    if (this.externalHyperlinkCount > 0) {
+      parts.push(Bun.file(this.hyperlinkRelTempFilePath));
+    }
+    parts.push('</Relationships>');
+    return parts;
   }
 
   async cleanup(): Promise<void> {
@@ -518,6 +653,37 @@ export class MultiSheetExcelStreamWriter {
         : undefined;
     const sheets = [...this.worksheets.entries()];
     const sheetNames = sheets.map(([name]) => name);
+    const featureCounters = {
+      nextCommentsIndex: 1,
+      nextDrawingIndex: 1,
+      nextTableIndex: 1,
+    };
+    const featureArtifacts = sheets.map(([name, sheet], index) => ({
+      name,
+      artifacts: sheet.writer.buildFeatureArtifacts(index + 1, featureCounters),
+      config: sheet.config,
+    }));
+    const workbookSheets = sheets.map(([name, sheet]) => ({
+      name,
+      state: sheet.config.state,
+    }));
+    const definedNames: DefinedName[] = [...(this.options.definedNames ?? [])];
+    for (let i = 0; i < sheets.length; i++) {
+      const [name, sheet] = sheets[i];
+      if (sheet.config.printArea) {
+        definedNames.push({
+          name: '_xlnm.Print_Area',
+          localSheetId: i,
+          refersTo: `${quoteSheetName(name)}!${absoluteCellRef(
+            sheet.config.printArea.startRow,
+            sheet.config.printArea.startCol,
+          )}:${absoluteCellRef(
+            sheet.config.printArea.endRow,
+            sheet.config.printArea.endCol,
+          )}`,
+        });
+      }
+    }
 
     try {
       await Promise.all(sheets.map(([, sheet]) => sheet.writer.close()));
@@ -527,7 +693,30 @@ export class MultiSheetExcelStreamWriter {
       });
 
       await zipWriter.addFile('[Content_Types].xml', [
-        buildContentTypes(sheetNames.length),
+        buildContentTypes(sheetNames.length, {
+          commentsCount: featureArtifacts.reduce(
+            (sum, item) => sum + item.artifacts.commentCount,
+            0,
+          ),
+          drawingsCount: featureArtifacts.reduce(
+            (sum, item) => sum + item.artifacts.drawingCount,
+            0,
+          ),
+          tablesCount: featureArtifacts.reduce(
+            (sum, item) => sum + item.artifacts.tableCount,
+            0,
+          ),
+          includeVml: featureArtifacts.some(
+            (item) => item.artifacts.commentCount > 0,
+          ),
+          mediaExtensions: [
+            ...new Set(
+              featureArtifacts.flatMap((item) => [
+                ...item.artifacts.mediaExtensions,
+              ]),
+            ),
+          ],
+        }),
       ]);
       await zipWriter.addFile('_rels/.rels', [buildRootRels()]);
       await zipWriter.addFile('docProps/app.xml', [
@@ -544,7 +733,10 @@ export class MultiSheetExcelStreamWriter {
         buildWorkbookRels(sheetNames.length),
       ]);
       await zipWriter.addFile('xl/workbook.xml', [
-        buildWorkbookXML(sheetNames),
+        buildWorkbookXML(workbookSheets, {
+          definedNames,
+          view: this.options.views,
+        }),
       ]);
       await zipWriter.addFile('xl/sharedStrings.xml', [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>',
@@ -552,9 +744,10 @@ export class MultiSheetExcelStreamWriter {
 
       for (let i = 0; i < sheets.length; i++) {
         const [, sheet] = sheets[i];
+        const artifacts = featureArtifacts[i].artifacts;
         await zipWriter.addFile(
           `xl/worksheets/sheet${i + 1}.xml`,
-          sheet.writer.buildWorksheetParts(),
+          sheet.writer.buildWorksheetParts(artifacts),
         );
       }
 
@@ -562,9 +755,26 @@ export class MultiSheetExcelStreamWriter {
         this.styleRegistry.buildStylesXML(),
       ]);
 
+      for (const item of featureArtifacts) {
+        for (const extraFile of item.artifacts.extraFiles) {
+          await zipWriter.addFile(extraFile.path, [extraFile.content]);
+        }
+      }
+
       for (let i = 0; i < sheets.length; i++) {
         const [, sheet] = sheets[i];
-        const relParts = sheet.writer.buildWorksheetRelParts();
+        const artifacts = featureArtifacts[i].artifacts;
+        const featureRelationshipXml = artifacts.relationships.map(
+          (relationship) =>
+            `<Relationship Id="${relationship.id}" Type="${relationship.type}" Target="${relationship.target}"${
+              relationship.targetMode
+                ? ` TargetMode="${relationship.targetMode}"`
+                : ''
+            }/>`,
+        );
+        const relParts = sheet.writer.buildWorksheetRelParts(
+          featureRelationshipXml,
+        );
         if (!relParts) continue;
         await zipWriter.addFile(
           `xl/worksheets/_rels/sheet${i + 1}.xml.rels`,

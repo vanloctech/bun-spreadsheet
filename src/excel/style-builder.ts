@@ -68,10 +68,13 @@ export class StyleRegistry {
     if (fillId > 0) xf += ' applyFill="1"';
     if (borderId > 0) xf += ' applyBorder="1"';
     if (numFmtId > 0) xf += ' applyNumberFormat="1"';
+    if (style.protection) xf += ' applyProtection="1"';
 
-    if (style.alignment) {
-      xf += ' applyAlignment="1">';
+    if (style.alignment || style.protection) {
+      if (style.alignment) xf += ' applyAlignment="1"';
+      xf += '>';
       xf += this.buildAlignment(style.alignment);
+      xf += this.buildProtection(style.protection);
       xf += '</xf>';
     } else {
       xf += '/>';
@@ -211,7 +214,8 @@ export class StyleRegistry {
     return id;
   }
 
-  private buildAlignment(align: AlignmentStyle): string {
+  private buildAlignment(align?: AlignmentStyle): string {
+    if (!align) return '';
     let xml = '<alignment';
     if (align.horizontal)
       xml += ` horizontal="${escapeXML(String(align.horizontal))}"`;
@@ -222,6 +226,19 @@ export class StyleRegistry {
       xml += ` textRotation="${getFiniteNumberOr(align.textRotation, 0)}"`;
     if (align.indent !== undefined)
       xml += ` indent="${getFiniteNumberOr(align.indent, 0)}"`;
+    xml += '/>';
+    return xml;
+  }
+
+  private buildProtection(protection: CellStyle['protection']): string {
+    if (!protection) return '';
+    let xml = '<protection';
+    if (protection.locked !== undefined) {
+      xml += ` locked="${protection.locked ? '1' : '0'}"`;
+    }
+    if (protection.hidden !== undefined) {
+      xml += ` hidden="${protection.hidden ? '1' : '0'}"`;
+    }
     xml += '/>';
     return xml;
   }

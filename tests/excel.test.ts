@@ -1,8 +1,23 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdirSync, rmSync } from 'node:fs';
-import { type CellStyle, readExcel, type Workbook, writeExcel } from '../src';
+import {
+  type CellStyle,
+  duplicateRow,
+  insertColumns,
+  insertRows,
+  readExcel,
+  spliceRows,
+  type Workbook,
+  writeExcel,
+} from '../src';
 
 const TMP = './tests/.tmp';
+const PNG_1X1 = Uint8Array.from(
+  Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mP8/5+hHgAHggJ/PF6edAAAAABJRU5ErkJggg==',
+    'base64',
+  ),
+);
 
 beforeAll(() => {
   mkdirSync(TMP, { recursive: true });
@@ -392,6 +407,240 @@ describe('Excel Reader', () => {
       fgColor: 'FFF2CC',
       bgColor: 'F4B183',
     });
+  });
+
+  test('writes and reads workbook and worksheet view settings', async () => {
+    const path = `${TMP}/worksheet-settings.xlsx`;
+    await writeExcel(path, {
+      creator: 'bun-spreadsheet',
+      views: {
+        activeTab: 1,
+        windowWidth: 24000,
+        windowHeight: 12000,
+      },
+      definedNames: [{ name: 'SalesData', refersTo: "'Visible'!$A$2:$B$3" }],
+      worksheets: [
+        {
+          name: 'Visible',
+          state: 'visible',
+          rows: [
+            {
+              cells: [{ value: 'Name' }, { value: 'Score' }],
+              outlineLevel: 1,
+              collapsed: true,
+            },
+            {
+              cells: [
+                { value: 'Alice' },
+                {
+                  value: 95,
+                  style: { protection: { locked: false } },
+                },
+              ],
+              hidden: true,
+              outlineLevel: 1,
+            },
+          ],
+          columns: [
+            { width: 20, hidden: true, outlineLevel: 1 },
+            { width: 15, collapsed: true, outlineLevel: 1 },
+          ],
+          protection: {
+            sheet: true,
+            autoFilter: true,
+            password: 'secret',
+          },
+          pageMargins: { left: 0.5, right: 0.5, top: 0.75, bottom: 0.75 },
+          pageSetup: {
+            orientation: 'landscape',
+            fitToWidth: 1,
+            fitToHeight: 1,
+          },
+          headerFooter: {
+            oddHeader: { left: 'Report', right: 'Page &P' },
+            oddFooter: { center: 'Confidential' },
+          },
+          printArea: { startRow: 0, startCol: 0, endRow: 1, endCol: 1 },
+        },
+        {
+          name: 'Hidden',
+          state: 'hidden',
+          rows: [{ cells: [{ value: 'secret' }] }],
+        },
+      ],
+    });
+
+    const wb = await readExcel(path);
+    expect(wb.views?.activeTab).toBe(1);
+    expect(wb.definedNames?.[0]).toEqual({
+      name: 'SalesData',
+      refersTo: "'Visible'!$A$2:$B$3",
+      comment: undefined,
+      hidden: false,
+      localSheetId: undefined,
+    });
+    expect(wb.worksheets[0].columns?.[0].hidden).toBe(true);
+    expect(wb.worksheets[0].rows[0].outlineLevel).toBe(1);
+    expect(wb.worksheets[0].rows[1].hidden).toBe(true);
+    expect(wb.worksheets[0].protection?.sheet).toBe(true);
+    expect(wb.worksheets[0].pageSetup?.orientation).toBe('landscape');
+    expect(wb.worksheets[0].headerFooter?.oddHeader?.left).toBe('Report');
+    expect(wb.worksheets[0].printArea).toEqual({
+      startRow: 0,
+      startCol: 0,
+      endRow: 1,
+      endCol: 1,
+    });
+    expect(wb.worksheets[1].state).toBe('hidden');
+  });
+});
+
+describe('Rich Text', () => {
+  test('writes and reads partial rich text styles', async () => {
+    const path = `${TMP}/rich-text.xlsx`;
+    await writeExcel(path, {
+      worksheets: [
+        {
+          name: 'Rich',
+          rows: [
+            {
+              cells: [
+                {
+                  value: 'Hello Bun',
+                  richText: [
+                    { text: 'Hello ', font: { bold: true, color: 'FF0000' } },
+                    { text: 'Bun', font: { italic: true, color: '0000FF' } },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    const cell = (await readExcel(path)).worksheets[0].rows[0].cells[0];
+    expect(cell.value).toBe('Hello Bun');
+    expect(cell.richText).toEqual([
+      { text: 'Hello ', font: { bold: true, color: 'FF0000' } },
+      { text: 'Bun', font: { italic: true, color: '0000FF' } },
+    ]);
+  });
+});
+
+describe('Comments, Images, and Tables', () => {
+  test('writes and reads comments, images, and tables', async () => {
+    const path = `${TMP}/comments-images-tables.xlsx`;
+    await writeExcel(path, {
+      worksheets: [
+        {
+          name: 'Assets',
+          rows: [
+            {
+              cells: [
+                {
+                  value: 'Product',
+                  comment: { text: 'Main product header', author: 'Loc' },
+                },
+                { value: 'Price' },
+                { value: 'Link' },
+              ],
+            },
+            {
+              cells: [
+                { value: 'Widget' },
+                { value: 99.5 },
+                {
+                  value: 'Docs',
+                  hyperlink: { target: 'https://bun.sh' },
+                },
+              ],
+            },
+            {
+              cells: [
+                { value: 'Gadget', comment: { text: 'Promo item' } },
+                { value: 149.25 },
+                { value: 'Guide' },
+              ],
+            },
+          ],
+          images: [
+            {
+              data: PNG_1X1,
+              format: 'png',
+              range: { startRow: 4, startCol: 0, endRow: 5, endCol: 1 },
+              name: 'Logo',
+              description: 'Tiny logo',
+            },
+          ],
+          tables: [
+            {
+              name: 'SalesTable',
+              range: { startRow: 0, startCol: 0, endRow: 2, endCol: 2 },
+              headerRow: true,
+              totalsRow: false,
+              style: { name: 'TableStyleMedium2', showRowStripes: true },
+            },
+          ],
+        },
+      ],
+    });
+
+    const wb = await readExcel(path);
+    const sheet = wb.worksheets[0];
+    expect(sheet.rows[0].cells[0].comment).toEqual({
+      text: 'Main product header',
+      author: 'Loc',
+    });
+    expect(sheet.rows[2].cells[0].comment).toEqual({
+      text: 'Promo item',
+      author: 'Author',
+    });
+    expect(sheet.images).toHaveLength(1);
+    expect(sheet.images?.[0].format).toBe('png');
+    expect(sheet.images?.[0].range).toEqual({
+      startRow: 4,
+      startCol: 0,
+      endRow: 5,
+      endCol: 1,
+    });
+    expect(new Uint8Array(sheet.images?.[0].data as Uint8Array)[0]).toBe(137);
+    expect(sheet.tables?.[0]).toMatchObject({
+      name: 'SalesTable',
+      range: { startRow: 0, startCol: 0, endRow: 2, endCol: 2 },
+      headerRow: true,
+      totalsRow: false,
+    });
+    expect(sheet.tables?.[0].columns?.map((column) => column.name)).toEqual([
+      'Product',
+      'Price',
+      'Link',
+    ]);
+  });
+});
+
+describe('Worksheet Operations', () => {
+  test('inserts, splices, duplicates rows and inserts columns', () => {
+    const worksheet: Workbook['worksheets'][number] = {
+      name: 'Ops',
+      rows: [
+        { cells: [{ value: 'A1' }, { value: 'B1' }] },
+        { cells: [{ value: 'A2' }, { value: 'B2' }] },
+      ],
+      columns: [{ width: 10 }, { width: 10 }],
+    };
+
+    insertRows(worksheet, 1, [{ cells: [{ value: 'X1' }, { value: 'Y1' }] }]);
+    duplicateRow(worksheet, 0, 1);
+    spliceRows(worksheet, 3, 1, [{ cells: [{ value: 'R' }, { value: 'S' }] }]);
+    insertColumns(worksheet, 1, 1);
+
+    expect(worksheet.rows).toHaveLength(4);
+    expect(worksheet.rows[1].cells[0].value).toBe('A1');
+    expect(worksheet.rows[2].cells[0].value).toBe('X1');
+    expect(worksheet.rows[3].cells[0].value).toBe('R');
+    expect(worksheet.rows[0].cells).toHaveLength(3);
+    expect(worksheet.columns).toHaveLength(3);
   });
 });
 

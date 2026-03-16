@@ -5,22 +5,36 @@
 import { type Zippable, zipSync } from 'fflate';
 import { toWriteTarget } from '../runtime-io';
 import type {
+  Cell,
+  DefinedName,
   ExcelWriteOptions,
   FileTarget,
+  Row,
   Workbook,
   Worksheet,
 } from '../types';
 import { buildAutoFilterXML } from './auto-filter';
 import { buildConditionalFormattingsXML } from './conditional-formatting';
 import { buildDataValidationsXML } from './data-validation';
+import {
+  buildSheetRelsXML,
+  buildWorksheetFeatureArtifacts,
+  type SheetRelationship,
+} from './sheet-parts';
 import { StyleRegistry } from './style-builder';
 import {
   buildAppPropsXML,
   buildCellRef,
   buildContentTypes,
   buildCorePropsXML,
+  buildHeaderFooterXML,
+  buildPageMarginsXML,
+  buildPageSetupXML,
+  buildRichTextXML,
   buildRootRels,
   buildSharedStrings,
+  buildSheetPropertiesXML,
+  buildSheetProtectionXML,
   buildSheetViewsXML,
   buildWorkbookRels,
   buildWorkbookXML,
@@ -30,6 +44,7 @@ import {
 } from './xml-builder';
 
 const encoder = new TextEncoder();
+const CELL_REF_PARTS_REGEX = /^([A-Z]+)(\d+)$/;
 
 /**
  * Write a Workbook to an Excel (.xlsx) file
@@ -69,25 +84,231 @@ export function buildExcelBuffer(
     return index;
   }
 
+  interface HyperlinkEntry {
+    ref: string;
+    rId?: string;
+    location?: string;
+    tooltip?: string;
+  }
+
+  function collectHyperlink(
+    ref: string,
+    cell: Cell,
+    relationships: SheetRelationship[],
+    hyperlinkEntries: HyperlinkEntry[],
+    nextRelId: () => string,
+  ): void {
+    if (!cell.hyperlink) return;
+
+    const hyperlink = cell.hyperlink;
+    if (isExternalHyperlink(hyperlink.target)) {
+      const relationshipId = nextRelId();
+      relationships.push({
+        id: relationshipId,
+        type: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink',
+        target: hyperlink.target,
+        targetMode: 'External',
+      });
+      hyperlinkEntries.push({
+        ref,
+        rId: relationshipId,
+        tooltip: hyperlink.tooltip,
+      });
+      return;
+    }
+
+    hyperlinkEntries.push({
+      ref,
+      location: hyperlink.target,
+      tooltip: hyperlink.tooltip,
+    });
+  }
+
+  function buildWorksheetColumnsXML(worksheet: Worksheet): string {
+    if (!worksheet.columns || worksheet.columns.length === 0) {
+      return '';
+    }
+
+    let xml = '<cols>';
+    for (let c = 0; c < worksheet.columns.length; c++) {
+      const col = worksheet.columns[c];
+      const colWidth = getFiniteNumber(col.width);
+      let colAttrs = ` min="${c + 1}" max="${c + 1}"`;
+      if (colWidth !== undefined) {
+        colAttrs += ` width="${colWidth}" customWidth="1"`;
+      }
+      if (col.hidden) colAttrs += ' hidden="1"';
+      if (col.collapsed) colAttrs += ' collapsed="1"';
+      if (col.outlineLevel !== undefined) {
+        colAttrs += ` outlineLevel="${Math.max(0, Math.trunc(col.outlineLevel))}"`;
+      }
+      xml += `<col${colAttrs}/>`;
+    }
+    xml += '</cols>';
+    return xml;
+  }
+
+  function buildWorksheetCellXML(
+    cell: Cell,
+    rowStyle: Row['style'],
+    ref: string,
+  ): string {
+    const cellStyle = cell.style || rowStyle;
+    const styleIdx = styleRegistry.registerStyle(cellStyle);
+    const { value } = cell;
+
+    if (value === null || value === undefined) {
+      if (cell.formula) {
+        let xml = `<c r="${ref}"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}>`;
+        xml += `<f>${escapeXML(cell.formula)}</f>`;
+        if (cell.formulaResult !== undefined) {
+          xml += `<v>${escapeXML(String(cell.formulaResult))}</v>`;
+        }
+        xml += '</c>';
+        return xml;
+      }
+      return styleIdx > 0 ? `<c r="${ref}" s="${styleIdx}"/>` : '';
+    }
+
+    if (cell.formula) {
+      let xml = `<c r="${ref}"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}>`;
+      xml += `<f>${escapeXML(cell.formula)}</f>`;
+      if (cell.formulaResult !== undefined) {
+        xml += `<v>${escapeXML(String(cell.formulaResult))}</v>`;
+      } else if (typeof value === 'string') {
+        xml += `<v>${getSharedStringIndex(value)}</v>`;
+      } else if (typeof value === 'number' || typeof value === 'boolean') {
+        xml += `<v>${value}</v>`;
+      }
+      xml += '</c>';
+      return xml;
+    }
+
+    if (cell.richText && cell.richText.length > 0) {
+      return `<c r="${ref}" t="inlineStr"${
+        styleIdx > 0 ? ` s="${styleIdx}"` : ''
+      }>${buildRichTextXML(cell.richText)}</c>`;
+    }
+
+    if (typeof value === 'string') {
+      return `<c r="${ref}" t="s"${
+        styleIdx > 0 ? ` s="${styleIdx}"` : ''
+      }><v>${getSharedStringIndex(value)}</v></c>`;
+    }
+
+    if (typeof value === 'number') {
+      return `<c r="${ref}"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}><v>${value}</v></c>`;
+    }
+
+    if (typeof value === 'boolean') {
+      return `<c r="${ref}" t="b"${
+        styleIdx > 0 ? ` s="${styleIdx}"` : ''
+      }><v>${value ? 1 : 0}</v></c>`;
+    }
+
+    if (value instanceof Date) {
+      return `<c r="${ref}"${
+        styleIdx > 0 ? ` s="${styleIdx}"` : ''
+      }><v>${dateToExcelSerial(value)}</v></c>`;
+    }
+
+    return '';
+  }
+
+  function buildWorksheetRowsXML(
+    worksheet: Worksheet,
+    relationships: SheetRelationship[],
+    hyperlinkEntries: HyperlinkEntry[],
+    nextRelId: () => string,
+  ): string {
+    let xml = '<sheetData>';
+
+    for (let r = 0; r < worksheet.rows.length; r++) {
+      const row = worksheet.rows[r];
+      if (!row) continue;
+
+      let rowAttrs = ` r="${r + 1}"`;
+      const rowHeight = getFiniteNumber(row.height);
+      if (rowHeight !== undefined) {
+        rowAttrs += ` ht="${rowHeight}" customHeight="1"`;
+      }
+      if (row.hidden) rowAttrs += ' hidden="1"';
+      if (row.collapsed) rowAttrs += ' collapsed="1"';
+      if (row.outlineLevel !== undefined) {
+        rowAttrs += ` outlineLevel="${Math.max(0, Math.trunc(row.outlineLevel))}"`;
+      }
+
+      const rowStyleIdx = row.style
+        ? styleRegistry.registerStyle(row.style)
+        : 0;
+      if (rowStyleIdx > 0) {
+        rowAttrs += ` s="${rowStyleIdx}" customFormat="1"`;
+      }
+
+      xml += `<row${rowAttrs}>`;
+      for (let c = 0; c < row.cells.length; c++) {
+        const cell = row.cells[c];
+        if (!cell) continue;
+
+        const ref = buildCellRef(r, c);
+        xml += buildWorksheetCellXML(cell, row.style, ref);
+        collectHyperlink(ref, cell, relationships, hyperlinkEntries, nextRelId);
+      }
+      xml += '</row>';
+    }
+
+    xml += '</sheetData>';
+    return xml;
+  }
+
+  function buildWorksheetHyperlinksXML(
+    hyperlinkEntries: HyperlinkEntry[],
+  ): string {
+    if (hyperlinkEntries.length === 0) {
+      return '';
+    }
+
+    let xml = '<hyperlinks>';
+    for (const hyperlink of hyperlinkEntries) {
+      xml += `<hyperlink ref="${hyperlink.ref}"`;
+      if (hyperlink.rId) xml += ` r:id="${hyperlink.rId}"`;
+      if (hyperlink.location) {
+        xml += ` location="${escapeXML(hyperlink.location)}"`;
+      }
+      if (hyperlink.tooltip) {
+        xml += ` tooltip="${escapeXML(hyperlink.tooltip)}"`;
+      }
+      xml += '/>';
+    }
+    xml += '</hyperlinks>';
+    return xml;
+  }
+
   /**
    * Build worksheet XML + collect hyperlink relationships
    */
-  function buildWorksheetXML(
-    worksheet: Worksheet,
-    _sheetIndex: number,
-  ): { xml: string; hyperlinkRels: { rId: string; target: string }[] } {
-    const hyperlinkRels: { rId: string; target: string }[] = [];
-    const hyperlinkEntries: {
-      ref: string;
-      rId?: string;
-      location?: string;
-      tooltip?: string;
-    }[] = [];
+  function buildWorksheetXML(worksheet: Worksheet): {
+    xml: string;
+    relationships: SheetRelationship[];
+    extraFiles: { path: string; content: Uint8Array }[];
+    mediaExtensions: Set<string>;
+    commentCount: number;
+    drawingCount: number;
+    tableCount: number;
+  } {
+    const relationships: SheetRelationship[] = [];
+    const hyperlinkEntries: HyperlinkEntry[] = [];
     let hyperlinkRelCounter = 1;
+    const nextHyperlinkRelId = () => `rId${hyperlinkRelCounter++}`;
 
     let xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
     xml +=
       '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
+
+    const hasOutlines =
+      worksheet.rows.some((row) => !!row.outlineLevel) ||
+      !!worksheet.columns?.some((column) => !!column.outlineLevel);
+    xml += buildSheetPropertiesXML(hasOutlines);
 
     xml += buildSheetViewsXML({
       freezePane: worksheet.freezePane,
@@ -101,147 +322,23 @@ export function buildExcelBuffer(
       xml += ` defaultColWidth="${defaultColWidth}"`;
     }
     xml += '/>';
+    xml += buildWorksheetColumnsXML(worksheet);
+    xml += buildWorksheetRowsXML(
+      worksheet,
+      relationships,
+      hyperlinkEntries,
+      nextHyperlinkRelId,
+    );
 
-    // Columns
-    if (worksheet.columns && worksheet.columns.length > 0) {
-      xml += '<cols>';
-      for (let c = 0; c < worksheet.columns.length; c++) {
-        const col = worksheet.columns[c];
-        const colWidth = getFiniteNumber(col.width);
-        if (colWidth !== undefined) {
-          xml += `<col min="${c + 1}" max="${c + 1}" width="${colWidth}" customWidth="1"/>`;
-        }
-      }
-      xml += '</cols>';
-    }
+    const featureArtifacts = buildWorksheetFeatureArtifacts(
+      worksheet,
+      sheetCounters,
+      {
+        startingRelIndex: hyperlinkRelCounter,
+      },
+    );
+    relationships.push(...featureArtifacts.relationships);
 
-    // Sheet data
-    xml += '<sheetData>';
-
-    for (let r = 0; r < worksheet.rows.length; r++) {
-      const row = worksheet.rows[r];
-      if (!row) continue;
-
-      let rowAttrs = ` r="${r + 1}"`;
-      const rowHeight = getFiniteNumber(row.height);
-      if (rowHeight !== undefined) {
-        rowAttrs += ` ht="${rowHeight}" customHeight="1"`;
-      }
-
-      // Register row-level style
-      const rowStyleIdx = row.style
-        ? styleRegistry.registerStyle(row.style)
-        : 0;
-      if (rowStyleIdx > 0) {
-        rowAttrs += ` s="${rowStyleIdx}" customFormat="1"`;
-      }
-
-      xml += `<row${rowAttrs}>`;
-
-      for (let c = 0; c < row.cells.length; c++) {
-        const cell = row.cells[c];
-        if (!cell) continue;
-
-        const ref = buildCellRef(r, c);
-
-        // Determine style — cell style takes priority, then row style
-        const cellStyle = cell.style || row.style;
-        const styleIdx = styleRegistry.registerStyle(cellStyle);
-
-        const { value } = cell;
-
-        if (value === null || value === undefined) {
-          // Cell might still have a formula or hyperlink even with null display value
-          if (cell.formula) {
-            xml += `<c r="${ref}"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}>`;
-            xml += `<f>${escapeXML(cell.formula)}</f>`;
-            if (cell.formulaResult !== undefined) {
-              xml += `<v>${escapeXML(String(cell.formulaResult))}</v>`;
-            }
-            xml += '</c>';
-          } else if (styleIdx > 0) {
-            xml += `<c r="${ref}" s="${styleIdx}"/>`;
-          }
-          // Collect hyperlink even for null-value cells
-          if (cell.hyperlink) {
-            const hl = cell.hyperlink;
-            if (isExternalHyperlink(hl.target)) {
-              const rId = `rId${hyperlinkRelCounter++}`;
-              hyperlinkRels.push({ rId, target: hl.target });
-              hyperlinkEntries.push({ ref, rId, tooltip: hl.tooltip });
-            } else {
-              hyperlinkEntries.push({
-                ref,
-                location: hl.target,
-                tooltip: hl.tooltip,
-              });
-            }
-          }
-          continue;
-        }
-
-        // Formula cells
-        if (cell.formula) {
-          xml += `<c r="${ref}"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}>`;
-          xml += `<f>${escapeXML(cell.formula)}</f>`;
-          if (cell.formulaResult !== undefined) {
-            xml += `<v>${escapeXML(String(cell.formulaResult))}</v>`;
-          } else if (value !== null && value !== undefined) {
-            // Use the value as cached result
-            if (typeof value === 'string') {
-              const ssIdx = getSharedStringIndex(value);
-              xml += `<v>${ssIdx}</v>`;
-            } else if (
-              typeof value === 'number' ||
-              typeof value === 'boolean'
-            ) {
-              xml += `<v>${value}</v>`;
-            }
-          }
-          xml += '</c>';
-        } else if (typeof value === 'string') {
-          const ssIdx = getSharedStringIndex(value);
-          xml += `<c r="${ref}" t="s"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}>`;
-          xml += `<v>${ssIdx}</v>`;
-          xml += '</c>';
-        } else if (typeof value === 'number') {
-          xml += `<c r="${ref}"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}>`;
-          xml += `<v>${value}</v>`;
-          xml += '</c>';
-        } else if (typeof value === 'boolean') {
-          xml += `<c r="${ref}" t="b"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}>`;
-          xml += `<v>${value ? 1 : 0}</v>`;
-          xml += '</c>';
-        } else if (value instanceof Date) {
-          const excelDate = dateToExcelSerial(value);
-          xml += `<c r="${ref}"${styleIdx > 0 ? ` s="${styleIdx}"` : ''}>`;
-          xml += `<v>${excelDate}</v>`;
-          xml += '</c>';
-        }
-
-        // Collect hyperlinks
-        if (cell.hyperlink) {
-          const hl = cell.hyperlink;
-          if (isExternalHyperlink(hl.target)) {
-            const rId = `rId${hyperlinkRelCounter++}`;
-            hyperlinkRels.push({ rId, target: hl.target });
-            hyperlinkEntries.push({ ref, rId, tooltip: hl.tooltip });
-          } else {
-            hyperlinkEntries.push({
-              ref,
-              location: hl.target,
-              tooltip: hl.tooltip,
-            });
-          }
-        }
-      }
-
-      xml += '</row>';
-    }
-
-    xml += '</sheetData>';
-
-    // Merge cells
     if (worksheet.mergeCells && worksheet.mergeCells.length > 0) {
       xml += `<mergeCells count="${worksheet.mergeCells.length}">`;
       for (const mc of worksheet.mergeCells) {
@@ -273,21 +370,54 @@ export function buildExcelBuffer(
       xml += dataValidationsXml;
     }
 
-    // Hyperlinks
-    if (hyperlinkEntries.length > 0) {
-      xml += '<hyperlinks>';
-      for (const hl of hyperlinkEntries) {
-        xml += `<hyperlink ref="${hl.ref}"`;
-        if (hl.rId) xml += ` r:id="${hl.rId}"`;
-        if (hl.location) xml += ` location="${escapeXML(hl.location)}"`;
-        if (hl.tooltip) xml += ` tooltip="${escapeXML(hl.tooltip)}"`;
-        xml += '/>';
-      }
-      xml += '</hyperlinks>';
-    }
+    xml += buildSheetProtectionXML(worksheet.protection);
+    xml += buildWorksheetHyperlinksXML(hyperlinkEntries);
+    xml += buildPageMarginsXML(worksheet.pageMargins);
+    xml += buildPageSetupXML(worksheet.pageSetup);
+    xml += buildHeaderFooterXML(worksheet.headerFooter);
+    xml += featureArtifacts.xmlPartsBeforeClose.join('');
 
     xml += '</worksheet>';
-    return { xml, hyperlinkRels };
+    return {
+      xml,
+      relationships,
+      extraFiles: featureArtifacts.extraFiles,
+      mediaExtensions: featureArtifacts.mediaExtensions,
+      commentCount: featureArtifacts.commentCount,
+      drawingCount: featureArtifacts.drawingCount,
+      tableCount: featureArtifacts.tableCount,
+    };
+  }
+
+  function quoteSheetName(name: string): string {
+    return `'${name.replace(/'/g, "''")}'`;
+  }
+
+  function absoluteCellRef(row: number, col: number): string {
+    const ref = buildCellRef(row, col);
+    const match = ref.match(CELL_REF_PARTS_REGEX);
+    if (!match) return ref;
+    return `$${match[1]}$${match[2]}`;
+  }
+
+  function buildWorkbookDefinedNames(workbookInput: Workbook): DefinedName[] {
+    const definedNames = [...(workbookInput.definedNames ?? [])];
+    for (let i = 0; i < workbookInput.worksheets.length; i++) {
+      const worksheet = workbookInput.worksheets[i];
+      if (!worksheet.printArea) continue;
+      definedNames.push({
+        name: '_xlnm.Print_Area',
+        localSheetId: i,
+        refersTo: `${quoteSheetName(worksheet.name)}!${absoluteCellRef(
+          worksheet.printArea.startRow,
+          worksheet.printArea.startCol,
+        )}:${absoluteCellRef(
+          worksheet.printArea.endRow,
+          worksheet.printArea.endCol,
+        )}`,
+      });
+    }
+    return definedNames;
   }
 
   /**
@@ -304,13 +434,28 @@ export function buildExcelBuffer(
 
   // Build all worksheet XMLs
   const sheetNames = workbook.worksheets.map((ws) => ws.name);
+  const workbookSheets = workbook.worksheets.map((worksheet) => ({
+    name: worksheet.name,
+    state: worksheet.state,
+  }));
+  const definedNames = buildWorkbookDefinedNames(workbook);
+  const sheetCounters = {
+    nextCommentsIndex: 1,
+    nextDrawingIndex: 1,
+    nextTableIndex: 1,
+  };
   const sheetResults: {
     xml: string;
-    hyperlinkRels: { rId: string; target: string }[];
+    relationships: SheetRelationship[];
+    extraFiles: { path: string; content: Uint8Array }[];
+    mediaExtensions: Set<string>;
+    commentCount: number;
+    drawingCount: number;
+    tableCount: number;
   }[] = [];
 
   for (let si = 0; si < workbook.worksheets.length; si++) {
-    sheetResults.push(buildWorksheetXML(workbook.worksheets[si], si));
+    sheetResults.push(buildWorksheetXML(workbook.worksheets[si]));
   }
 
   const workbookCreator = options?.creator ?? workbook.creator;
@@ -319,7 +464,28 @@ export function buildExcelBuffer(
 
   // Build ZIP structure
   const files: Zippable = {
-    '[Content_Types].xml': encoder.encode(buildContentTypes(sheetNames.length)),
+    '[Content_Types].xml': encoder.encode(
+      buildContentTypes(sheetNames.length, {
+        commentsCount: sheetResults.reduce(
+          (sum, result) => sum + result.commentCount,
+          0,
+        ),
+        drawingsCount: sheetResults.reduce(
+          (sum, result) => sum + result.drawingCount,
+          0,
+        ),
+        tablesCount: sheetResults.reduce(
+          (sum, result) => sum + result.tableCount,
+          0,
+        ),
+        includeVml: sheetResults.some((result) => result.commentCount > 0),
+        mediaExtensions: [
+          ...new Set(
+            sheetResults.flatMap((result) => [...result.mediaExtensions]),
+          ),
+        ],
+      }),
+    ),
     '_rels/.rels': encoder.encode(buildRootRels()),
     'docProps/app.xml': encoder.encode(buildAppPropsXML(sheetNames)),
     'docProps/core.xml': encoder.encode(
@@ -332,7 +498,12 @@ export function buildExcelBuffer(
     'xl/_rels/workbook.xml.rels': encoder.encode(
       buildWorkbookRels(sheetNames.length),
     ),
-    'xl/workbook.xml': encoder.encode(buildWorkbookXML(sheetNames)),
+    'xl/workbook.xml': encoder.encode(
+      buildWorkbookXML(workbookSheets, {
+        definedNames,
+        view: workbook.views,
+      }),
+    ),
     'xl/styles.xml': encoder.encode(styleRegistry.buildStylesXML()),
     'xl/sharedStrings.xml': encoder.encode(buildSharedStrings(sharedStrings)),
   };
@@ -342,18 +513,14 @@ export function buildExcelBuffer(
       sheetResults[i].xml,
     );
 
-    // Build per-sheet .rels file for hyperlinks
-    const hypRels = sheetResults[i].hyperlinkRels;
-    if (hypRels.length > 0) {
-      let relsXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
-      relsXml +=
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
-      for (const rel of hypRels) {
-        relsXml += `<Relationship Id="${rel.rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="${escapeXML(rel.target)}" TargetMode="External"/>`;
-      }
-      relsXml += '</Relationships>';
-      files[`xl/worksheets/_rels/sheet${i + 1}.xml.rels`] =
-        encoder.encode(relsXml);
+    for (const extraFile of sheetResults[i].extraFiles) {
+      files[extraFile.path] = extraFile.content;
+    }
+
+    if (sheetResults[i].relationships.length > 0) {
+      files[`xl/worksheets/_rels/sheet${i + 1}.xml.rels`] = encoder.encode(
+        buildSheetRelsXML(sheetResults[i].relationships),
+      );
     }
   }
 

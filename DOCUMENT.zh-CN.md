@@ -27,12 +27,16 @@ bun-spreadsheet 完整 API 参考。
   - [Row](#row)
   - [Cell](#cell)
   - [CellValue](#cellvalue)
+  - [CellComment](#cellcomment)
+  - [BinaryData](#binarydata)
   - [ColumnConfig](#columnconfig)
   - [MergeCell](#mergecell)
   - [SplitPane](#splitpane)
   - [Hyperlink](#hyperlink)
   - [DataValidation](#datavalidation)
   - [ConditionalFormatting](#conditionalformatting)
+  - [WorksheetImage](#worksheetimage)
+  - [WorksheetTable](#worksheettable)
 - [样式](#样式)
   - [CellStyle](#cellstyle)
   - [FontStyle](#fontstyle)
@@ -47,6 +51,9 @@ bun-spreadsheet 完整 API 参考。
   - [自动筛选](#自动筛选)
   - [冻结窗格](#冻结窗格)
   - [拆分视图](#拆分视图)
+  - [单元格批注 / 备注](#单元格批注--备注)
+  - [图片](#图片)
+  - [表格](#表格)
   - [数据验证](#数据验证)
   - [条件格式](#条件格式)
 - [写入模式对比](#写入模式对比)
@@ -398,6 +405,8 @@ await remoteStream.end();
 | `sheetName` | `string` | `"Sheet1"` | 工作表名称 |
 | `columns` | `ColumnConfig[]` | `undefined` | 列宽配置 |
 | `defaultRowHeight` | `number` | `15` | 默认行高 |
+| `images` | `WorksheetImage[]` | `undefined` | 要嵌入到工作表中的图片 |
+| `tables` | `WorksheetTable[]` | `undefined` | 结构化 Excel 表格 |
 | `freezePane` | `{ row, col }` | `undefined` | 冻结窗格位置 |
 | `splitPane` | `SplitPane` | `undefined` | 拆分视图配置 |
 | `mergeCells` | `MergeCell[]` | `undefined` | 合并单元格区域 |
@@ -468,6 +477,18 @@ await remoteStream.end();
 | `writeRow(row: Row \| CellValue[])` | 向当前工作表写入一行 |
 | `flush()` | 刷新缓冲区 |
 | `end(): Promise<void>` | 完成 |
+
+**`addSheet(name, options?)` 常用选项：**
+
+| 选项 | 类型 | 描述 |
+|------|------|------|
+| `columns` | `ColumnConfig[]` | 当前工作表的列配置 |
+| `images` | `WorksheetImage[]` | 当前工作表中的图片 |
+| `tables` | `WorksheetTable[]` | 当前工作表中的结构化表格 |
+| `freezePane` | `{ row, col }` | 冻结窗格 |
+| `splitPane` | `SplitPane` | 拆分视图 |
+| `mergeCells` | `MergeCell[]` | 合并单元格区域 |
+| `autoFilter` | `CellRange` | 自动筛选范围 |
 
 **示例：**
 
@@ -584,6 +605,8 @@ interface Workbook {
   creator?: string;      // 作者名称
   created?: Date;        // 创建时间
   modified?: Date;       // 修改时间
+  definedNames?: DefinedName[];
+  views?: WorkbookView;
 }
 ```
 
@@ -604,8 +627,12 @@ interface Worksheet {
   splitPane?: SplitPane;                     // 拆分视图配置
   defaultRowHeight?: number;                 // 默认行高
   defaultColWidth?: number;                  // 默认列宽
+  images?: WorksheetImage[];                 // 工作表图片
+  tables?: WorksheetTable[];                 // 结构化表格
 }
 ```
+
+`images` 和 `tables` 是工作表级功能；批注/备注通过 `Cell.comment` 挂在单元格上。
 
 ### Row
 
@@ -624,9 +651,11 @@ interface Cell {
   value: CellValue;                                // 单元格值
   style?: CellStyle;                               // 单元格样式
   type?: "string" | "number" | "boolean" | "date" | "formula";
+  richText?: RichTextRun[];                        // 单个单元格内的局部富文本样式
   formula?: string;                                // 公式（不含 "="）
   formulaResult?: string | number | boolean;       // 公式缓存结果
   hyperlink?: Hyperlink;                           // 单元格超链接
+  comment?: CellComment;                           // 单元格批注 / 备注
 }
 ```
 
@@ -635,6 +664,23 @@ interface Cell {
 ```typescript
 type CellValue = string | number | boolean | Date | null | undefined;
 ```
+
+### CellComment
+
+```typescript
+interface CellComment {
+  text: string;
+  author?: string;
+}
+```
+
+### BinaryData
+
+```typescript
+type BinaryData = Uint8Array | ArrayBuffer;
+```
+
+用于嵌入图片时传递原始二进制数据。
 
 ### ColumnConfig
 
@@ -790,6 +836,59 @@ interface ConditionalFormatThreshold {
 - `colorScale`、`dataBar`、`iconSet` 使用 Excel 内置的可视化规则，不需要 `style`。
 - `priority` 对应 Excel 规则顺序，数字越小越先执行。
 - API 中所有范围均为 0 基准，内部会自动转换为 Excel A1 引用。
+
+### WorksheetImage
+
+```typescript
+interface WorksheetImage {
+  data: BinaryData;
+  format: "png" | "jpeg" | "jpg" | "gif";
+  range: CellRange;
+  name?: string;
+  description?: string;
+}
+```
+
+**说明：**
+
+- `range` 用来决定图片在工作表中的锚定区域。
+- `data` 必须是已经在内存中的图片字节数据。
+- `readExcel()` 会把嵌入图片重新返回到 `worksheet.images`。
+
+### WorksheetTable
+
+```typescript
+interface WorksheetTable {
+  name: string;
+  displayName?: string;
+  range: CellRange;
+  headerRow?: boolean;
+  totalsRow?: boolean;
+  columns?: WorksheetTableColumn[];
+  style?: WorksheetTableStyle;
+}
+
+interface WorksheetTableColumn {
+  name: string;
+  totalsRowLabel?: string;
+  totalsRowFunction?: "sum" | "average" | "count" | "countNums" | "max" | "min"
+    | "stdDev" | "var" | "custom";
+}
+
+interface WorksheetTableStyle {
+  name?: string;
+  showFirstColumn?: boolean;
+  showLastColumn?: boolean;
+  showRowStripes?: boolean;
+  showColumnStripes?: boolean;
+}
+```
+
+**说明：**
+
+- `range` 必须覆盖整张表。
+- `name` 在同一个工作簿里必须唯一。
+- 在 stream 和 chunked writer 中，建议显式传入 `columns`，这样表头元数据最稳定。
 
 ---
 
@@ -1064,6 +1163,141 @@ const worksheet: Worksheet = {
 
 ---
 
+### 单元格批注 / 备注
+
+使用 `cell.comment` 给某个单元格写入 Excel 批注/备注。
+
+```typescript
+const worksheet: Worksheet = {
+  name: "Comments",
+  rows: [
+    {
+      cells: [
+        {
+          value: "状态",
+          comment: {
+            text: "这一列由审核人填写",
+            author: "Loc",
+          },
+        },
+        { value: "负责人" },
+      ],
+    },
+    {
+      cells: [
+        {
+          value: "待处理",
+          comment: { text: "等待审批" },
+        },
+        { value: "Alice" },
+      ],
+    },
+  ],
+};
+```
+
+**说明：**
+
+- `author` 可选，不传也能显示备注文本。
+- 批注是单元格级功能，不是工作表级配置。
+- 在流式写入器中，如果要写批注，请使用 `Row` 对象而不是纯数组，因为纯数组不能携带 `cell.comment`。
+- `readExcel()` 会把批注返回到 `cell.comment`。
+
+---
+
+### 图片
+
+使用 `worksheet.images` 嵌入 PNG、JPEG 或 GIF 图片，并把它们锚定到指定单元格区域。
+
+```typescript
+const logoBytes = await Bun.file("./logo.png").bytes();
+
+const worksheet: Worksheet = {
+  name: "Dashboard",
+  rows: [
+    { cells: [{ value: "销售看板" }] },
+    { cells: [{ value: "2026 年 Q1" }] },
+  ],
+  images: [
+    {
+      data: logoBytes,
+      format: "png",
+      range: { startRow: 0, startCol: 3, endRow: 3, endCol: 5 },
+      name: "Company Logo",
+      description: "右上角 Logo",
+    },
+  ],
+};
+```
+
+**说明：**
+
+- 支持的格式有 `png`、`jpeg` / `jpg`、`gif`。
+- `data` 必须是原始字节数据（`Uint8Array` 或 `ArrayBuffer`），不是文件路径。
+- 图片显示大小由 `range` 决定。
+- `createExcelStream`、`createMultiSheetExcelStream` 和 `createChunkedExcelStream` 都支持通过工作表配置写图片。
+- `readExcel()` 会返回 `worksheet.images`，其中包含图片字节和锚定区域。
+
+---
+
+### 表格
+
+使用 `worksheet.tables` 创建带表头、可选汇总行和内置样式的结构化 Excel 表格。
+
+```typescript
+const worksheet: Worksheet = {
+  name: "Orders",
+  rows: [
+    { cells: [{ value: "订单号" }, { value: "区域" }, { value: "金额" }] },
+    { cells: [{ value: "A-1001" }, { value: "North" }, { value: 1250 }] },
+    { cells: [{ value: "A-1002" }, { value: "South" }, { value: 980 }] },
+    { cells: [{ value: "A-1003" }, { value: "West" }, { value: 1640 }] },
+  ],
+  tables: [
+    {
+      name: "OrdersTable",
+      range: { startRow: 0, startCol: 0, endRow: 3, endCol: 2 },
+      headerRow: true,
+      totalsRow: false,
+      columns: [
+        { name: "订单号" },
+        { name: "区域" },
+        { name: "金额" },
+      ],
+      style: {
+        name: "TableStyleMedium2",
+        showRowStripes: true,
+      },
+    },
+  ],
+};
+```
+
+**汇总行示例：**
+
+```typescript
+{
+  name: "SalesTable",
+  range: { startRow: 0, startCol: 0, endRow: 10, endCol: 2 },
+  headerRow: true,
+  totalsRow: true,
+  columns: [
+    { name: "月份" },
+    { name: "收入", totalsRowFunction: "sum" },
+    { name: "负责人", totalsRowLabel: "合计" },
+  ],
+}
+```
+
+**说明：**
+
+- `range` 必须覆盖整个表格区域。
+- `columns` 的数量应与 `range` 的列数一致。
+- 在 stream 和 chunked writer 中，建议显式提供 `table.columns`，因为这些 writer 不会把所有工作表行一直保存在内存里。
+- `readExcel()` 会把表格定义返回到 `worksheet.tables`。
+
+---
+
 ### 数据验证
 
 使用工作表级别的 `dataValidations` 为单元格范围设置下拉列表、数字范围、日期限制或自定义公式。
@@ -1233,6 +1467,9 @@ const worksheet: Worksheet = {
 | 公式 | 完整支持 | 完整支持 | 完整支持 |
 | 工作簿属性 | 完整支持 | 完整支持 | 完整支持 |
 | 超链接 | 完整支持 | 完整支持 | 完整支持 |
+| 批注 / 备注 | 完整支持 | 完整支持 | 完整支持 |
+| 图片 | 完整支持 | 完整支持 | 完整支持 |
+| 表格 | 完整支持 | 完整支持 | 完整支持 |
 | 合并单元格 | 完整支持 | 完整支持 | 完整支持 |
 | 自动筛选 | 完整支持 | 完整支持 | 完整支持 |
 | 冻结窗格 | 完整支持 | 完整支持 | 完整支持 |
@@ -1246,3 +1483,5 @@ const worksheet: Worksheet = {
 - **`writeExcel`** — 所有数据都已在内存中。最简单的 API。
 - **`createExcelStream`** — 数据逐行生成（如来自数据库查询）。使用磁盘落地路径，适合本地文件或 `S3File` 目标。
 - **`createChunkedExcelStream`** — 需要关注内存的超大文件。以磁盘 I/O 换取恒定内存使用。
+- 如果要写批注，请使用 `Row` 对象而不是纯数组。
+- 如果要在流式模式里写表格，建议显式传入 `table.columns`。

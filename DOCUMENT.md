@@ -27,12 +27,16 @@ Complete API reference for bun-spreadsheet.
   - [Row](#row)
   - [Cell](#cell)
   - [CellValue](#cellvalue)
+  - [CellComment](#cellcomment)
+  - [BinaryData](#binarydata)
   - [ColumnConfig](#columnconfig)
   - [MergeCell](#mergecell)
   - [SplitPane](#splitpane)
   - [Hyperlink](#hyperlink)
   - [DataValidation](#datavalidation)
   - [ConditionalFormatting](#conditionalformatting)
+  - [WorksheetImage](#worksheetimage)
+  - [WorksheetTable](#worksheettable)
 - [Styles](#styles)
   - [CellStyle](#cellstyle)
   - [FontStyle](#fontstyle)
@@ -47,6 +51,9 @@ Complete API reference for bun-spreadsheet.
   - [Auto Filters](#auto-filters)
   - [Freeze Panes](#freeze-panes)
   - [Split Views](#split-views)
+  - [Cell Comments / Notes](#cell-comments--notes)
+  - [Images](#images)
+  - [Tables](#tables)
   - [Data Validation](#data-validation)
   - [Conditional Formatting](#conditional-formatting)
 - [Writing Modes Comparison](#writing-modes-comparison)
@@ -414,6 +421,8 @@ Create a streaming Excel writer. Uses disk-backed temp files and inline strings,
 | `sheetName` | `string` | `"Sheet1"` | Name of the worksheet |
 | `columns` | `ColumnConfig[]` | `undefined` | Column width configurations |
 | `defaultRowHeight` | `number` | `15` | Default row height |
+| `images` | `WorksheetImage[]` | `undefined` | Worksheet images to embed |
+| `tables` | `WorksheetTable[]` | `undefined` | Structured Excel tables |
 | `freezePane` | `{ row, col }` | `undefined` | Freeze pane position |
 | `splitPane` | `SplitPane` | `undefined` | Split view configuration |
 | `mergeCells` | `MergeCell[]` | `undefined` | Merge cell ranges |
@@ -490,6 +499,8 @@ Create a streaming Excel writer with support for multiple sheets. Each sheet is 
 | Option | Type | Description |
 |--------|------|-------------|
 | `columns` | `ColumnConfig[]` | Column configurations for this sheet |
+| `images` | `WorksheetImage[]` | Images embedded in this sheet |
+| `tables` | `WorksheetTable[]` | Structured tables written for this sheet |
 | `freezePane` | `{ row, col }` | Freeze pane |
 | `splitPane` | `SplitPane` | Split view |
 | `mergeCells` | `MergeCell[]` | Merge cell ranges |
@@ -622,6 +633,8 @@ interface Workbook {
   creator?: string;      // Author name
   created?: Date;        // Created timestamp
   modified?: Date;       // Modified timestamp
+  definedNames?: DefinedName[];
+  views?: WorkbookView;
 }
 ```
 
@@ -642,8 +655,12 @@ interface Worksheet {
   splitPane?: SplitPane;                     // Split view configuration
   defaultRowHeight?: number;                 // Default row height
   defaultColWidth?: number;                  // Default column width
+  images?: WorksheetImage[];                 // Embedded worksheet images
+  tables?: WorksheetTable[];                 // Structured tables
 }
 ```
+
+`images` and `tables` are worksheet-level features. Comments/notes are attached per cell via `Cell.comment`.
 
 ### Row
 
@@ -662,9 +679,11 @@ interface Cell {
   value: CellValue;                                // Cell value
   style?: CellStyle;                               // Cell style
   type?: "string" | "number" | "boolean" | "date" | "formula";
+  richText?: RichTextRun[];                        // Partial formatting within one cell
   formula?: string;                                // Formula (without "=")
   formulaResult?: string | number | boolean;       // Cached formula result
   hyperlink?: Hyperlink;                           // Hyperlink on this cell
+  comment?: CellComment;                           // Cell comment / note
 }
 ```
 
@@ -673,6 +692,23 @@ interface Cell {
 ```typescript
 type CellValue = string | number | boolean | Date | null | undefined;
 ```
+
+### CellComment
+
+```typescript
+interface CellComment {
+  text: string;
+  author?: string;
+}
+```
+
+### BinaryData
+
+```typescript
+type BinaryData = Uint8Array | ArrayBuffer;
+```
+
+Used for embedded images. Pass raw bytes that are already available in memory.
 
 ### ColumnConfig
 
@@ -828,6 +864,59 @@ interface ConditionalFormatThreshold {
 - `colorScale`, `dataBar`, and `iconSet` use Excel's built-in visual rules and do not require a `style`.
 - `priority` follows Excel's rule order. Lower numbers are evaluated first.
 - All ranges are 0-based in the API and are written as Excel A1 references internally.
+
+### WorksheetImage
+
+```typescript
+interface WorksheetImage {
+  data: BinaryData;
+  format: "png" | "jpeg" | "jpg" | "gif";
+  range: CellRange;
+  name?: string;
+  description?: string;
+}
+```
+
+**Notes:**
+
+- `range` controls the image anchor rectangle in worksheet coordinates.
+- `data` must be image bytes already loaded in memory.
+- `readExcel()` returns the embedded image bytes back in `worksheet.images`.
+
+### WorksheetTable
+
+```typescript
+interface WorksheetTable {
+  name: string;
+  displayName?: string;
+  range: CellRange;
+  headerRow?: boolean;
+  totalsRow?: boolean;
+  columns?: WorksheetTableColumn[];
+  style?: WorksheetTableStyle;
+}
+
+interface WorksheetTableColumn {
+  name: string;
+  totalsRowLabel?: string;
+  totalsRowFunction?: "sum" | "average" | "count" | "countNums" | "max" | "min"
+    | "stdDev" | "var" | "custom";
+}
+
+interface WorksheetTableStyle {
+  name?: string;
+  showFirstColumn?: boolean;
+  showLastColumn?: boolean;
+  showRowStripes?: boolean;
+  showColumnStripes?: boolean;
+}
+```
+
+**Notes:**
+
+- `range` includes the header row and totals row if they are enabled.
+- `name` must be unique within the workbook.
+- In stream and chunked writers, pass `columns` explicitly for predictable table headers.
 
 ---
 
@@ -1136,6 +1225,141 @@ const worksheet: Worksheet = {
 
 ---
 
+### Cell Comments / Notes
+
+Use `cell.comment` to write an Excel comment/note on a specific cell.
+
+```typescript
+const worksheet: Worksheet = {
+  name: "Comments",
+  rows: [
+    {
+      cells: [
+        {
+          value: "Status",
+          comment: {
+            text: "This column is filled by the reviewer",
+            author: "Loc",
+          },
+        },
+        { value: "Owner" },
+      ],
+    },
+    {
+      cells: [
+        {
+          value: "Pending",
+          comment: { text: "Waiting for approval" },
+        },
+        { value: "Alice" },
+      ],
+    },
+  ],
+};
+```
+
+**Notes:**
+
+- `author` is optional. If omitted, Excel still shows the note text.
+- Comments are attached to cells, not worksheet-level options.
+- In streaming writers, use `Row` objects when you need comments because plain arrays cannot carry metadata.
+- `readExcel()` returns comments in `cell.comment`.
+
+---
+
+### Images
+
+Use `worksheet.images` to embed PNG, JPEG, or GIF assets anchored to a cell range.
+
+```typescript
+const logoBytes = await Bun.file("./logo.png").bytes();
+
+const worksheet: Worksheet = {
+  name: "Dashboard",
+  rows: [
+    { cells: [{ value: "Sales Dashboard" }] },
+    { cells: [{ value: "Q1 2026" }] },
+  ],
+  images: [
+    {
+      data: logoBytes,
+      format: "png",
+      range: { startRow: 0, startCol: 3, endRow: 3, endCol: 5 },
+      name: "Company Logo",
+      description: "Top-right dashboard logo",
+    },
+  ],
+};
+```
+
+**Notes:**
+
+- Supported formats are `png`, `jpeg` / `jpg`, and `gif`.
+- `data` must be raw bytes (`Uint8Array` or `ArrayBuffer`), not a file path.
+- The image is anchored using `range`; larger ranges produce larger rendered images in Excel.
+- `createExcelStream`, `createMultiSheetExcelStream`, and `createChunkedExcelStream` support worksheet images via their sheet options.
+- `readExcel()` returns embedded images as `worksheet.images` with their original bytes and anchor range.
+
+---
+
+### Tables
+
+Use `worksheet.tables` to create structured Excel tables with headers, optional totals rows, and built-in table styles.
+
+```typescript
+const worksheet: Worksheet = {
+  name: "Orders",
+  rows: [
+    { cells: [{ value: "Order ID" }, { value: "Region" }, { value: "Amount" }] },
+    { cells: [{ value: "A-1001" }, { value: "North" }, { value: 1250 }] },
+    { cells: [{ value: "A-1002" }, { value: "South" }, { value: 980 }] },
+    { cells: [{ value: "A-1003" }, { value: "West" }, { value: 1640 }] },
+  ],
+  tables: [
+    {
+      name: "OrdersTable",
+      range: { startRow: 0, startCol: 0, endRow: 3, endCol: 2 },
+      headerRow: true,
+      totalsRow: false,
+      columns: [
+        { name: "Order ID" },
+        { name: "Region" },
+        { name: "Amount" },
+      ],
+      style: {
+        name: "TableStyleMedium2",
+        showRowStripes: true,
+      },
+    },
+  ],
+};
+```
+
+**Totals row example:**
+
+```typescript
+{
+  name: "SalesTable",
+  range: { startRow: 0, startCol: 0, endRow: 10, endCol: 2 },
+  headerRow: true,
+  totalsRow: true,
+  columns: [
+    { name: "Month" },
+    { name: "Revenue", totalsRowFunction: "sum" },
+    { name: "Owner", totalsRowLabel: "Total" },
+  ],
+}
+```
+
+**Notes:**
+
+- `range` must cover the entire table area.
+- `columns` should match the number of columns in `range`.
+- In stream and chunked writers, pass `columns` explicitly. Those writers do not keep all worksheet rows in memory, so explicit headers are the reliable option.
+- `readExcel()` returns table definitions in `worksheet.tables`.
+
+---
+
 ### Data Validation
 
 Use worksheet-level `dataValidations` to enforce dropdown lists, numeric ranges, date windows, or custom formulas in Excel.
@@ -1305,6 +1529,9 @@ const worksheet: Worksheet = {
 | Formulas | Full support | Full support | Full support |
 | Workbook properties | Full support | Full support | Full support |
 | Hyperlinks | Full support | Full support | Full support |
+| Comments / Notes | Full support | Full support | Full support |
+| Images | Full support | Full support | Full support |
+| Tables | Full support | Full support | Full support |
 | Merge Cells | Full support | Full support | Full support |
 | Auto Filters | Full support | Full support | Full support |
 | Freeze Panes | Full support | Full support | Full support |
@@ -1318,3 +1545,5 @@ const worksheet: Worksheet = {
 - **`writeExcel`** -- You have all data ready in memory. Simplest API.
 - **`createExcelStream`** -- Data is generated row-by-row (e.g., from database query). Disk-backed and suitable for local files or `S3File` targets.
 - **`createChunkedExcelStream`** -- Extreme large files where memory is a concern. Trades some disk I/O for constant memory usage.
+- For comments, use `Row` objects rather than plain arrays so you can attach `cell.comment`.
+- For streaming tables, pass `table.columns` explicitly for stable header metadata.

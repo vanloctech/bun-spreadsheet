@@ -22,25 +22,38 @@ import type {
   ColumnConfig,
   ConditionalFormatting,
   DataValidation,
+  DefinedName,
   ExcelWriteOptions,
   FileTarget,
   MergeCell,
   Row,
   StreamWriter,
+  WorkbookView,
   Worksheet,
 } from '../types';
 import { buildAutoFilterXML } from './auto-filter';
+import { type CommentEntry, commentRefFromCoords } from './comments';
 import { buildConditionalFormattingsXML } from './conditional-formatting';
 import { buildDataValidationsXML } from './data-validation';
 import { ManagedFileSink } from './file-sink';
 import { createTempRuntimeId } from './runtime-utils';
+import {
+  buildSheetRelsXML,
+  buildWorksheetFeatureArtifacts,
+} from './sheet-parts';
 import { StyleRegistry } from './style-builder';
 import {
   buildAppPropsXML,
   buildCellRef,
   buildContentTypes,
   buildCorePropsXML,
+  buildHeaderFooterXML,
+  buildPageMarginsXML,
+  buildPageSetupXML,
+  buildRichTextXML,
   buildRootRels,
+  buildSheetPropertiesXML,
+  buildSheetProtectionXML,
   buildSheetViewsXML,
   buildWorkbookRels,
   buildWorkbookXML,
@@ -49,6 +62,8 @@ import {
   getFiniteNumberOr,
 } from './xml-builder';
 import { StreamingZipWriter } from './zip-stream';
+
+const CELL_REF_PARTS_REGEX = /^([A-Z]+)(\d+)$/;
 
 /**
  * Options for the chunked Excel stream writer
@@ -72,6 +87,26 @@ export interface ChunkedExcelStreamOptions extends ExcelWriteOptions {
   conditionalFormattings?: ConditionalFormatting[];
   /** Data validation rules */
   dataValidations?: DataValidation[];
+  /** Worksheet state */
+  state?: Worksheet['state'];
+  /** Sheet protection */
+  protection?: Worksheet['protection'];
+  /** Page margins */
+  pageMargins?: Worksheet['pageMargins'];
+  /** Page setup */
+  pageSetup?: Worksheet['pageSetup'];
+  /** Header/footer */
+  headerFooter?: Worksheet['headerFooter'];
+  /** Print area */
+  printArea?: Worksheet['printArea'];
+  /** Worksheet images */
+  images?: Worksheet['images'];
+  /** Worksheet tables */
+  tables?: Worksheet['tables'];
+  /** Workbook defined names */
+  definedNames?: DefinedName[];
+  /** Workbook views */
+  views?: WorkbookView;
 }
 
 function createTempFilePath(prefix: string): string {
@@ -83,6 +118,17 @@ function createOutputTempPath(outputPath: string): string {
     dirname(outputPath),
     `.bun-spreadsheet-${createTempRuntimeId()}.tmp`,
   );
+}
+
+function quoteSheetName(name: string): string {
+  return `'${name.replace(/'/g, "''")}'`;
+}
+
+function absoluteCellRef(row: number, col: number): string {
+  const ref = buildCellRef(row, col);
+  const match = ref.match(CELL_REF_PARTS_REGEX);
+  if (!match) return ref;
+  return `$${match[1]}$${match[2]}`;
 }
 
 /**
@@ -109,6 +155,8 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
   private hyperlinkCount = 0;
   private externalHyperlinkCount = 0;
   private hyperlinkRelCounter = 1;
+  private hasOutlineLevels = false;
+  private readonly commentEntries: CommentEntry[] = [];
   private ended = false;
 
   constructor(target: FileTarget, options?: ChunkedExcelStreamOptions) {
@@ -163,6 +211,12 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
 
     if (value === null || value === undefined) {
       return styleIdx > 0 ? `<c r="${ref}" s="${styleIdx}"/>` : '';
+    }
+
+    if (cell.richText && cell.richText.length > 0) {
+      return `<c r="${ref}" t="inlineStr"${
+        styleIdx > 0 ? ` s="${styleIdx}"` : ''
+      }>${buildRichTextXML(cell.richText)}</c>`;
     }
 
     // Use INLINE strings (<is><t>...</t></is>) instead of shared strings
@@ -220,6 +274,11 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
     xml +=
       '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
 
+    xml += buildSheetPropertiesXML(
+      this.hasOutlineLevels ||
+        !!this.options.columns?.some((column) => !!column.outlineLevel),
+    );
+
     xml += buildSheetViewsXML({
       freezePane: this.options.freezePane,
       splitPane: this.options.splitPane,
@@ -231,9 +290,16 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
       for (let c = 0; c < this.options.columns.length; c++) {
         const col = this.options.columns[c];
         const colWidth = getFiniteNumber(col.width);
+        let colAttrs = ` min="${c + 1}" max="${c + 1}"`;
         if (colWidth !== undefined) {
-          xml += `<col min="${c + 1}" max="${c + 1}" width="${colWidth}" customWidth="1"/>`;
+          colAttrs += ` width="${colWidth}" customWidth="1"`;
         }
+        if (col.hidden) colAttrs += ' hidden="1"';
+        if (col.collapsed) colAttrs += ' collapsed="1"';
+        if (col.outlineLevel !== undefined) {
+          colAttrs += ` outlineLevel="${Math.max(0, Math.trunc(col.outlineLevel))}"`;
+        }
+        xml += `<col${colAttrs}/>`;
       }
       xml += '</cols>';
     }
@@ -275,6 +341,26 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
       parts.push(dataValidationsXml);
     }
 
+    const protectionXml = buildSheetProtectionXML(this.options.protection);
+    if (protectionXml) {
+      parts.push(protectionXml);
+    }
+
+    const pageMarginsXml = buildPageMarginsXML(this.options.pageMargins);
+    if (pageMarginsXml) {
+      parts.push(pageMarginsXml);
+    }
+
+    const pageSetupXml = buildPageSetupXML(this.options.pageSetup);
+    if (pageSetupXml) {
+      parts.push(pageSetupXml);
+    }
+
+    const headerFooterXml = buildHeaderFooterXML(this.options.headerFooter);
+    if (headerFooterXml) {
+      parts.push(headerFooterXml);
+    }
+
     parts.push('</worksheet>');
     return parts;
   }
@@ -300,6 +386,12 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
     if (rowHeight !== undefined) {
       rowAttrs += ` ht="${rowHeight}" customHeight="1"`;
     }
+    if (rowObj.hidden) rowAttrs += ' hidden="1"';
+    if (rowObj.collapsed) rowAttrs += ' collapsed="1"';
+    if (rowObj.outlineLevel !== undefined) {
+      rowAttrs += ` outlineLevel="${Math.max(0, Math.trunc(rowObj.outlineLevel))}"`;
+      this.hasOutlineLevels = true;
+    }
 
     const rowStyleIdx = rowObj.style
       ? this.styleRegistry.registerStyle(rowObj.style)
@@ -314,6 +406,12 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
       const cell = rowObj.cells[c];
       if (!cell) continue;
       const ref = buildCellRef(r, c);
+      if (cell.comment) {
+        this.commentEntries.push({
+          ref: commentRefFromCoords(r, c),
+          comment: cell.comment,
+        });
+      }
       xml += this.serializeCell(cell, ref, rowObj.style);
     }
 
@@ -381,11 +479,51 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
       ]);
 
       const sheetName = this.options.sheetName || 'Sheet1';
+      const definedNames = [...(this.options.definedNames ?? [])];
+      if (this.options.printArea) {
+        definedNames.push({
+          name: '_xlnm.Print_Area',
+          localSheetId: 0,
+          refersTo: `${quoteSheetName(sheetName)}!${absoluteCellRef(
+            this.options.printArea.startRow,
+            this.options.printArea.startCol,
+          )}:${absoluteCellRef(
+            this.options.printArea.endRow,
+            this.options.printArea.endCol,
+          )}`,
+        });
+      }
       const zipWriter = new StreamingZipWriter(tempOutputPath ?? this.target, {
         compress: this.options.compress,
       });
 
-      await zipWriter.addFile('[Content_Types].xml', [buildContentTypes(1)]);
+      const featureArtifacts = buildWorksheetFeatureArtifacts(
+        {
+          name: sheetName,
+          rows: [],
+          images: this.options.images,
+          tables: this.options.tables,
+        },
+        {
+          nextCommentsIndex: 1,
+          nextDrawingIndex: 1,
+          nextTableIndex: 1,
+        },
+        {
+          commentEntries: this.commentEntries,
+          startingRelIndex: this.hyperlinkRelCounter,
+        },
+      );
+
+      await zipWriter.addFile('[Content_Types].xml', [
+        buildContentTypes(1, {
+          commentsCount: featureArtifacts.commentCount,
+          drawingsCount: featureArtifacts.drawingCount,
+          tablesCount: featureArtifacts.tableCount,
+          includeVml: featureArtifacts.commentCount > 0,
+          mediaExtensions: [...featureArtifacts.mediaExtensions],
+        }),
+      ]);
       await zipWriter.addFile('_rels/.rels', [buildRootRels()]);
       await zipWriter.addFile('docProps/app.xml', [
         buildAppPropsXML([sheetName]),
@@ -401,7 +539,10 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
         buildWorkbookRels(1),
       ]);
       await zipWriter.addFile('xl/workbook.xml', [
-        buildWorkbookXML([sheetName]),
+        buildWorkbookXML([{ name: sheetName, state: this.options.state }], {
+          definedNames,
+          view: this.options.views,
+        }),
       ]);
       await zipWriter.addFile('xl/sharedStrings.xml', [
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>',
@@ -413,6 +554,11 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
       ];
 
       const worksheetSuffixParts = this.buildWorksheetSuffix();
+      worksheetSuffixParts.splice(
+        worksheetSuffixParts.length - 1,
+        0,
+        ...featureArtifacts.xmlPartsBeforeClose,
+      );
       if (this.hyperlinkCount > 0) {
         const worksheetClosingTag = worksheetSuffixParts.pop();
         if (worksheetClosingTag) {
@@ -429,12 +575,46 @@ export class ExcelChunkedStreamWriter implements StreamWriter {
         this.styleRegistry.buildStylesXML(),
       ]);
 
-      if (this.externalHyperlinkCount > 0) {
-        await zipWriter.addFile('xl/worksheets/_rels/sheet1.xml.rels', [
-          '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
-          Bun.file(this.hyperlinkRelTempFilePath),
-          '</Relationships>',
-        ]);
+      for (const extraFile of featureArtifacts.extraFiles) {
+        await zipWriter.addFile(extraFile.path, [extraFile.content]);
+      }
+
+      if (
+        this.externalHyperlinkCount > 0 ||
+        featureArtifacts.relationships.length > 0
+      ) {
+        const relXml =
+          this.externalHyperlinkCount > 0
+            ? (() => {
+                const rels: string[] = [];
+                for (const relationship of featureArtifacts.relationships) {
+                  rels.push(
+                    `<Relationship Id="${relationship.id}" Type="${relationship.type}" Target="${relationship.target}"${
+                      relationship.targetMode
+                        ? ` TargetMode="${relationship.targetMode}"`
+                        : ''
+                    }/>`,
+                  );
+                }
+                return [
+                  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+                  ...rels,
+                ];
+              })()
+            : [buildSheetRelsXML(featureArtifacts.relationships)];
+
+        if (this.externalHyperlinkCount > 0) {
+          await zipWriter.addFile('xl/worksheets/_rels/sheet1.xml.rels', [
+            ...relXml,
+            Bun.file(this.hyperlinkRelTempFilePath),
+            '</Relationships>',
+          ]);
+        } else {
+          await zipWriter.addFile(
+            'xl/worksheets/_rels/sheet1.xml.rels',
+            relXml,
+          );
+        }
       }
 
       await zipWriter.close();

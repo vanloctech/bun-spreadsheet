@@ -22,6 +22,12 @@ export interface FontStyle {
   color?: string; // hex color e.g. "FF0000"
 }
 
+/** Rich text run within a single cell */
+export interface RichTextRun {
+  text: string;
+  font?: FontStyle;
+}
+
 /** Fill style */
 export interface FillStyle {
   type: 'pattern' | 'gradient';
@@ -80,6 +86,10 @@ export interface CellStyle {
   border?: BorderStyle;
   alignment?: AlignmentStyle;
   numberFormat?: string; // e.g. "#,##0.00", "yyyy-mm-dd"
+  protection?: {
+    locked?: boolean;
+    hidden?: boolean;
+  };
 }
 
 /** Hyperlink */
@@ -89,6 +99,15 @@ export interface Hyperlink {
   /** Optional tooltip text shown on hover */
   tooltip?: string;
 }
+
+/** Cell comment/note */
+export interface CellComment {
+  text: string;
+  author?: string;
+}
+
+/** Binary data accepted for embedded workbook assets */
+export type BinaryData = Uint8Array | ArrayBuffer;
 
 /** Cell/range coordinates */
 export interface CellRange {
@@ -227,12 +246,15 @@ export interface Cell {
   value: CellValue;
   style?: CellStyle;
   type?: 'string' | 'number' | 'boolean' | 'date' | 'formula';
+  richText?: RichTextRun[];
   /** Formula expression (without leading '='), e.g. "SUM(A1:A10)" */
   formula?: string;
   /** Cached result of the formula (shown before recalculation) */
   formulaResult?: string | number | boolean;
   /** Hyperlink on this cell */
   hyperlink?: Hyperlink;
+  /** Optional cell comment/note */
+  comment?: CellComment;
 }
 
 /** A row of cells */
@@ -240,6 +262,9 @@ export interface Row {
   cells: Cell[];
   height?: number;
   style?: CellStyle;
+  hidden?: boolean;
+  collapsed?: boolean;
+  outlineLevel?: number;
 }
 
 /** Column configuration */
@@ -247,10 +272,112 @@ export interface ColumnConfig {
   width?: number;
   style?: CellStyle;
   header?: string;
+  hidden?: boolean;
+  collapsed?: boolean;
+  outlineLevel?: number;
 }
 
 /** Merge cell range */
 export interface MergeCell extends CellRange {}
+
+export type WorksheetState = 'visible' | 'hidden' | 'veryHidden';
+
+export interface WorksheetProtection {
+  password?: string;
+  sheet?: boolean;
+  objects?: boolean;
+  scenarios?: boolean;
+  formatCells?: boolean;
+  formatColumns?: boolean;
+  formatRows?: boolean;
+  insertColumns?: boolean;
+  insertRows?: boolean;
+  insertHyperlinks?: boolean;
+  deleteColumns?: boolean;
+  deleteRows?: boolean;
+  selectLockedCells?: boolean;
+  sort?: boolean;
+  autoFilter?: boolean;
+  pivotTables?: boolean;
+  selectUnlockedCells?: boolean;
+}
+
+export interface PageMargins {
+  left?: number;
+  right?: number;
+  top?: number;
+  bottom?: number;
+  header?: number;
+  footer?: number;
+}
+
+export interface PageSetup {
+  orientation?: 'portrait' | 'landscape';
+  paperSize?: number;
+  scale?: number;
+  fitToWidth?: number;
+  fitToHeight?: number;
+  firstPageNumber?: number;
+  useFirstPageNumber?: boolean;
+}
+
+export interface HeaderFooterSection {
+  left?: string;
+  center?: string;
+  right?: string;
+}
+
+export interface HeaderFooter {
+  differentFirst?: boolean;
+  differentOddEven?: boolean;
+  oddHeader?: HeaderFooterSection;
+  oddFooter?: HeaderFooterSection;
+  evenHeader?: HeaderFooterSection;
+  evenFooter?: HeaderFooterSection;
+  firstHeader?: HeaderFooterSection;
+  firstFooter?: HeaderFooterSection;
+}
+
+export interface WorksheetImage {
+  data: BinaryData;
+  format: 'png' | 'jpeg' | 'jpg' | 'gif';
+  range: CellRange;
+  name?: string;
+  description?: string;
+}
+
+export interface WorksheetTableColumn {
+  name: string;
+  totalsRowLabel?: string;
+  totalsRowFunction?:
+    | 'sum'
+    | 'average'
+    | 'count'
+    | 'countNums'
+    | 'max'
+    | 'min'
+    | 'stdDev'
+    | 'var'
+    | 'custom';
+}
+
+export interface WorksheetTableStyle {
+  name?: string;
+  showFirstColumn?: boolean;
+  showLastColumn?: boolean;
+  showRowStripes?: boolean;
+  showColumnStripes?: boolean;
+}
+
+export interface WorksheetTable {
+  name: string;
+  displayName?: string;
+  range: CellRange;
+  headerRow?: boolean;
+  totalsRow?: boolean;
+  columns?: WorksheetTableColumn[];
+  style?: WorksheetTableStyle;
+}
 
 /** Worksheet */
 export interface Worksheet {
@@ -265,6 +392,32 @@ export interface Worksheet {
   splitPane?: SplitPane;
   defaultRowHeight?: number;
   defaultColWidth?: number;
+  state?: WorksheetState;
+  protection?: WorksheetProtection;
+  pageMargins?: PageMargins;
+  pageSetup?: PageSetup;
+  headerFooter?: HeaderFooter;
+  printArea?: CellRange;
+  images?: WorksheetImage[];
+  tables?: WorksheetTable[];
+}
+
+export interface DefinedName {
+  name: string;
+  refersTo: string;
+  comment?: string;
+  hidden?: boolean;
+  localSheetId?: number;
+}
+
+export interface WorkbookView {
+  activeTab?: number;
+  firstSheet?: number;
+  visibility?: 'visible' | 'hidden' | 'veryHidden';
+  xWindow?: number;
+  yWindow?: number;
+  windowWidth?: number;
+  windowHeight?: number;
 }
 
 /** Workbook */
@@ -273,6 +426,8 @@ export interface Workbook {
   creator?: string;
   created?: Date;
   modified?: Date;
+  definedNames?: DefinedName[];
+  views?: WorkbookView;
 }
 
 /** CSV read options */
@@ -307,6 +462,8 @@ export interface ExcelWriteOptions {
   created?: Date;
   modified?: Date;
   compress?: boolean;
+  definedNames?: DefinedName[];
+  views?: WorkbookView;
 }
 
 /** Stream writer interface */

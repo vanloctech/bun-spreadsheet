@@ -16,17 +16,27 @@ import type {
   CellStyle,
   CellValue,
   ColumnConfig,
+  DefinedName,
   ExcelReadOptions,
   FileSource,
   FillStyle,
   FontStyle,
+  HeaderFooter,
+  PageMargins,
+  PageSetup,
+  RichTextRun,
   Row,
   Workbook,
+  WorkbookView,
   Worksheet,
+  WorksheetProtection,
 } from '../types';
 import { parseAutoFilter } from './auto-filter';
+import { parseCommentsXML } from './comments';
 import { parseConditionalFormattings } from './conditional-formatting';
 import { parseDataValidations } from './data-validation';
+import { parseDrawingImages } from './images';
+import { parseTableXML } from './tables';
 import { excelSerialToDate } from './xlsx-writer';
 import { letterToColIndex, parseCellRef } from './xml-builder';
 import {
@@ -41,6 +51,12 @@ import {
 const CELL_REF_REGEX = /^([A-Z]+)(\d+)$/;
 const RGB_PREFIX_REGEX = /^FF/;
 const COL_LETTER_REGEX = /^([A-Z]+)/;
+const LEADING_EQUALS_REGEX = /^=+/;
+const LEADING_SINGLE_QUOTE_REGEX = /^'/;
+const TRAILING_SINGLE_QUOTE_REGEX = /'$/;
+const HEADER_FOOTER_LEFT_REGEX = /&L([^&]*)/;
+const HEADER_FOOTER_CENTER_REGEX = /&C([^&]*)/;
+const HEADER_FOOTER_RIGHT_REGEX = /&R([^&]*)/;
 const BUILTIN_NUMFMTS: Record<number, string> = {
   14: 'yyyy-mm-dd',
   15: 'd-mmm-yy',
@@ -63,6 +79,41 @@ const MAX_ZIP_ENTRIES = 10_000; // 10K max entries in ZIP
 const MAX_ROWS = 1_048_576; // Excel max rows
 const MAX_COLS = 16_384; // Excel max columns (XFD)
 const MAX_SHARED_STRINGS = 10_000_000; // 10M max shared strings
+
+interface SheetRelationships {
+  hyperlinks: Map<string, string>;
+  commentsPath?: string;
+  drawingPath?: string;
+  tablePaths: string[];
+}
+
+function parseRangeRef(rangeRef: string) {
+  const [startRef, endRef = startRef] = rangeRef.split(':');
+  const start = parseCellRef(startRef.replace(/\$/g, ''));
+  const end = parseCellRef(endRef.replace(/\$/g, ''));
+  return {
+    startRow: start.row,
+    startCol: start.col,
+    endRow: end.row,
+    endCol: end.col,
+  };
+}
+
+function resolveSheetPartPath(baseDir: string, target: string): string {
+  if (target.startsWith('/')) {
+    return target.slice(1);
+  }
+
+  const segments = baseDir.split('/').filter(Boolean);
+  for (const part of target.split('/')) {
+    if (part === '..') {
+      segments.pop();
+    } else if (part !== '.' && part !== '') {
+      segments.push(part);
+    }
+  }
+  return segments.join('/');
+}
 
 /**
  * Read an Excel file and return a Workbook
@@ -134,8 +185,11 @@ export async function readExcel(
   // Parse workbook to get sheet info
   const workbookXML = decoder.decode(zip['xl/workbook.xml']);
   const workbookDoc = parseXML(workbookXML);
-  const sheetsNode = findChild(workbookDoc.children[0], 'sheets');
+  const workbookRoot = workbookDoc.children[0];
+  const sheetsNode = findChild(workbookRoot, 'sheets');
   const sheetNodes = sheetsNode ? findChildren(sheetsNode, 'sheet') : [];
+  const workbookView = parseWorkbookView(workbookRoot);
+  const definedNames = parseDefinedNames(workbookRoot);
 
   // Parse workbook rels to get sheet paths
   const relsXML = decoder.decode(zip['xl/_rels/workbook.xml.rels']);
@@ -182,18 +236,13 @@ export async function readExcel(
     const sheetXML = decoder.decode(sheetData);
 
     // Parse per-sheet rels for hyperlinks
-    const sheetRelsPath = `xl/worksheets/_rels/${target.includes('/') ? target.split('/').pop() : target}.rels`;
-    const sheetRelsData = zip[sheetRelsPath];
-    const hyperlinkRelMap = new Map<string, string>();
-    if (sheetRelsData) {
-      const relsXMLStr = decoder.decode(sheetRelsData);
-      const relsDoc2 = parseXML(relsXMLStr);
-      for (const rel of relsDoc2.children[0]?.children || []) {
-        if (rel.attributes.Type?.includes('hyperlink')) {
-          hyperlinkRelMap.set(rel.attributes.Id, rel.attributes.Target);
-        }
-      }
-    }
+    const sheetRelsPath = `xl/worksheets/_rels/${
+      target.includes('/') ? target.split('/').pop() : target
+    }.rels`;
+    const sheetRelationships =
+      sheetRelsPath in zip
+        ? parseSheetRelationships(decoder.decode(zip[sheetRelsPath]))
+        : { hyperlinks: new Map<string, string>(), tablePaths: [] };
 
     const worksheet = parseWorksheet(
       sheetXML,
@@ -201,12 +250,55 @@ export async function readExcel(
       sharedStrings,
       styles.cellStyles,
       styles.differentialStyles,
-      hyperlinkRelMap,
+      sheetRelationships,
+      zip,
+      decoder,
     );
+    const sheetState = sheetNode.attributes.state as
+      | Worksheet['state']
+      | undefined;
+    if (sheetState) {
+      worksheet.state = sheetState;
+    }
     worksheets.push(worksheet);
   }
 
-  return { worksheets, ...workbookProps };
+  for (const definedName of definedNames) {
+    if (definedName.name !== '_xlnm.Print_Area') continue;
+    let sheetIndex = definedName.localSheetId;
+    let ref = definedName.refersTo;
+
+    const bangIndex = ref.lastIndexOf('!');
+    if (bangIndex !== -1) {
+      const sheetNameRef = ref
+        .slice(0, bangIndex)
+        .replace(LEADING_EQUALS_REGEX, '');
+      ref = ref.slice(bangIndex + 1);
+      if (sheetIndex === undefined) {
+        const normalizedSheetName = sheetNameRef
+          .replace(LEADING_SINGLE_QUOTE_REGEX, '')
+          .replace(TRAILING_SINGLE_QUOTE_REGEX, '');
+        sheetIndex = worksheets.findIndex(
+          (worksheet) => worksheet.name === normalizedSheetName,
+        );
+      }
+    }
+
+    if (
+      sheetIndex !== undefined &&
+      sheetIndex >= 0 &&
+      sheetIndex < worksheets.length
+    ) {
+      worksheets[sheetIndex].printArea = parseRangeRef(ref);
+    }
+  }
+
+  return {
+    worksheets,
+    ...workbookProps,
+    definedNames: definedNames.length > 0 ? definedNames : undefined,
+    views: workbookView,
+  };
 }
 
 function parseWorkbookProperties(
@@ -243,6 +335,38 @@ function parseWorkbookProperties(
   }
 
   return props;
+}
+
+function parseSheetRelationships(relsXml: string): SheetRelationships {
+  const relsDoc = parseXML(relsXml);
+  const relationships: SheetRelationships = {
+    hyperlinks: new Map<string, string>(),
+    tablePaths: [],
+  };
+
+  for (const rel of relsDoc.children[0]?.children || []) {
+    const target = rel.attributes.Target;
+    const type = rel.attributes.Type || '';
+    if (!target) continue;
+
+    if (type.includes('hyperlink')) {
+      relationships.hyperlinks.set(rel.attributes.Id, target);
+      continue;
+    }
+    if (type.includes('/comments')) {
+      relationships.commentsPath = target;
+      continue;
+    }
+    if (type.includes('/drawing')) {
+      relationships.drawingPath = target;
+      continue;
+    }
+    if (type.includes('/table')) {
+      relationships.tablePaths.push(target);
+    }
+  }
+
+  return relationships;
 }
 
 /**
@@ -491,6 +615,17 @@ function parseAlignmentNode(alignment: XMLNode): AlignmentStyle {
   return style;
 }
 
+function parseProtectionNode(protection: XMLNode): CellStyle['protection'] {
+  const style: NonNullable<CellStyle['protection']> = {};
+  if (protection.attributes.locked !== undefined) {
+    style.locked = protection.attributes.locked === '1';
+  }
+  if (protection.attributes.hidden !== undefined) {
+    style.hidden = protection.attributes.hidden === '1';
+  }
+  return Object.keys(style).length > 0 ? style : undefined;
+}
+
 function isDateNumberFormat(numberFormat: string | undefined): boolean {
   if (!numberFormat) return false;
 
@@ -541,7 +676,651 @@ function parseCellXfStyle(
     style.alignment = parseAlignmentNode(alignment);
   }
 
+  const protection = findChild(xf, 'protection');
+  if (protection) {
+    style.protection = parseProtectionNode(protection);
+  }
+
   return style;
+}
+
+function parseWorkbookView(root: XMLNode): WorkbookView | undefined {
+  const bookViews = findChild(root, 'bookViews');
+  const workbookView = bookViews
+    ? findChild(bookViews, 'workbookView')
+    : undefined;
+  if (!workbookView) return undefined;
+
+  const view: WorkbookView = {};
+  if (workbookView.attributes.activeTab) {
+    view.activeTab = Number.parseInt(workbookView.attributes.activeTab, 10);
+  }
+  if (workbookView.attributes.firstSheet) {
+    view.firstSheet = Number.parseInt(workbookView.attributes.firstSheet, 10);
+  }
+  if (workbookView.attributes.visibility) {
+    view.visibility = workbookView.attributes
+      .visibility as WorkbookView['visibility'];
+  }
+  if (workbookView.attributes.xWindow) {
+    view.xWindow = Number.parseInt(workbookView.attributes.xWindow, 10);
+  }
+  if (workbookView.attributes.yWindow) {
+    view.yWindow = Number.parseInt(workbookView.attributes.yWindow, 10);
+  }
+  if (workbookView.attributes.windowWidth) {
+    view.windowWidth = Number.parseInt(workbookView.attributes.windowWidth, 10);
+  }
+  if (workbookView.attributes.windowHeight) {
+    view.windowHeight = Number.parseInt(
+      workbookView.attributes.windowHeight,
+      10,
+    );
+  }
+  return Object.keys(view).length > 0 ? view : undefined;
+}
+
+function parseDefinedNames(root: XMLNode): DefinedName[] {
+  const definedNamesNode = findChild(root, 'definedNames');
+  if (!definedNamesNode) return [];
+
+  const definedNames: DefinedName[] = [];
+  for (const node of findChildren(definedNamesNode, 'definedName')) {
+    const name = node.attributes.name;
+    if (!name) continue;
+    definedNames.push({
+      name,
+      refersTo: getTextContent(node),
+      comment: node.attributes.comment,
+      hidden: node.attributes.hidden === '1',
+      localSheetId: node.attributes.localSheetId
+        ? Number.parseInt(node.attributes.localSheetId, 10)
+        : undefined,
+    });
+  }
+  return definedNames;
+}
+
+function parseRichTextRuns(isNode: XMLNode): RichTextRun[] {
+  const runs: RichTextRun[] = [];
+  for (const rNode of findChildren(isNode, 'r')) {
+    const tNode = findChild(rNode, 't');
+    if (!tNode) continue;
+    const run: RichTextRun = { text: getTextContent(tNode) };
+    const rPr = findChild(rNode, 'rPr');
+    if (rPr) {
+      const font: FontStyle = {};
+      if (findChild(rPr, 'b')) font.bold = true;
+      if (findChild(rPr, 'i')) font.italic = true;
+      if (findChild(rPr, 'u')) font.underline = true;
+      if (findChild(rPr, 'strike')) font.strike = true;
+      const sz = findChild(rPr, 'sz');
+      if (sz?.attributes.val) {
+        font.size = Number.parseFloat(sz.attributes.val);
+      }
+      const color = findChild(rPr, 'color');
+      if (color?.attributes.rgb) {
+        font.color = color.attributes.rgb.replace(RGB_PREFIX_REGEX, '');
+      }
+      const rFont = findChild(rPr, 'rFont');
+      if (rFont?.attributes.val) {
+        font.name = rFont.attributes.val;
+      }
+      if (Object.keys(font).length > 0) {
+        run.font = font;
+      }
+    }
+    runs.push(run);
+  }
+  return runs;
+}
+
+function parseHeaderFooterSection(value: string | undefined) {
+  if (!value) return undefined;
+  const section: NonNullable<HeaderFooter['oddHeader']> = {};
+  const leftMatch = value.match(HEADER_FOOTER_LEFT_REGEX);
+  const centerMatch = value.match(HEADER_FOOTER_CENTER_REGEX);
+  const rightMatch = value.match(HEADER_FOOTER_RIGHT_REGEX);
+  if (leftMatch) section.left = leftMatch[1];
+  if (centerMatch) section.center = centerMatch[1];
+  if (rightMatch) section.right = rightMatch[1];
+  return Object.keys(section).length > 0 ? section : undefined;
+}
+
+function parseHeaderFooter(root: XMLNode): HeaderFooter | undefined {
+  const headerFooterNode = findChild(root, 'headerFooter');
+  if (!headerFooterNode) return undefined;
+
+  const headerFooter: HeaderFooter = {
+    differentFirst: headerFooterNode.attributes.differentFirst === '1',
+    differentOddEven: headerFooterNode.attributes.differentOddEven === '1',
+    oddHeader: parseHeaderFooterSection(
+      getTextContent(
+        findChild(headerFooterNode, 'oddHeader') ?? {
+          tag: '',
+          attributes: Object.create(null),
+          children: [],
+          text: '',
+        },
+      ),
+    ),
+    oddFooter: parseHeaderFooterSection(
+      getTextContent(
+        findChild(headerFooterNode, 'oddFooter') ?? {
+          tag: '',
+          attributes: Object.create(null),
+          children: [],
+          text: '',
+        },
+      ),
+    ),
+    evenHeader: parseHeaderFooterSection(
+      getTextContent(
+        findChild(headerFooterNode, 'evenHeader') ?? {
+          tag: '',
+          attributes: Object.create(null),
+          children: [],
+          text: '',
+        },
+      ),
+    ),
+    evenFooter: parseHeaderFooterSection(
+      getTextContent(
+        findChild(headerFooterNode, 'evenFooter') ?? {
+          tag: '',
+          attributes: Object.create(null),
+          children: [],
+          text: '',
+        },
+      ),
+    ),
+    firstHeader: parseHeaderFooterSection(
+      getTextContent(
+        findChild(headerFooterNode, 'firstHeader') ?? {
+          tag: '',
+          attributes: Object.create(null),
+          children: [],
+          text: '',
+        },
+      ),
+    ),
+    firstFooter: parseHeaderFooterSection(
+      getTextContent(
+        findChild(headerFooterNode, 'firstFooter') ?? {
+          tag: '',
+          attributes: Object.create(null),
+          children: [],
+          text: '',
+        },
+      ),
+    ),
+  };
+
+  return Object.values(headerFooter).some(
+    (value) => value !== undefined && value !== false,
+  )
+    ? headerFooter
+    : undefined;
+}
+
+function parsePageMargins(root: XMLNode): PageMargins | undefined {
+  const node = findChild(root, 'pageMargins');
+  if (!node) return undefined;
+  const margins: PageMargins = {};
+  for (const key of [
+    'left',
+    'right',
+    'top',
+    'bottom',
+    'header',
+    'footer',
+  ] as const) {
+    if (node.attributes[key]) {
+      margins[key] = Number.parseFloat(node.attributes[key]);
+    }
+  }
+  return Object.keys(margins).length > 0 ? margins : undefined;
+}
+
+function parsePageSetup(root: XMLNode): PageSetup | undefined {
+  const node = findChild(root, 'pageSetup');
+  if (!node) return undefined;
+  const pageSetup: PageSetup = {};
+  if (node.attributes.orientation) {
+    pageSetup.orientation = node.attributes
+      .orientation as PageSetup['orientation'];
+  }
+  if (node.attributes.paperSize) {
+    pageSetup.paperSize = Number.parseInt(node.attributes.paperSize, 10);
+  }
+  if (node.attributes.scale) {
+    pageSetup.scale = Number.parseInt(node.attributes.scale, 10);
+  }
+  if (node.attributes.fitToWidth) {
+    pageSetup.fitToWidth = Number.parseInt(node.attributes.fitToWidth, 10);
+  }
+  if (node.attributes.fitToHeight) {
+    pageSetup.fitToHeight = Number.parseInt(node.attributes.fitToHeight, 10);
+  }
+  if (node.attributes.firstPageNumber) {
+    pageSetup.firstPageNumber = Number.parseInt(
+      node.attributes.firstPageNumber,
+      10,
+    );
+  }
+  if (node.attributes.useFirstPageNumber) {
+    pageSetup.useFirstPageNumber = node.attributes.useFirstPageNumber === '1';
+  }
+  return Object.keys(pageSetup).length > 0 ? pageSetup : undefined;
+}
+
+function parseWorksheetProtection(
+  root: XMLNode,
+): WorksheetProtection | undefined {
+  const node = findChild(root, 'sheetProtection');
+  if (!node) return undefined;
+  const protection: WorksheetProtection = {};
+  if (node.attributes.password) protection.password = node.attributes.password;
+  for (const key of [
+    'sheet',
+    'objects',
+    'scenarios',
+    'formatCells',
+    'formatColumns',
+    'formatRows',
+    'insertColumns',
+    'insertRows',
+    'insertHyperlinks',
+    'deleteColumns',
+    'deleteRows',
+    'selectLockedCells',
+    'sort',
+    'autoFilter',
+    'pivotTables',
+    'selectUnlockedCells',
+  ] as const) {
+    if (node.attributes[key] !== undefined) {
+      protection[key] = node.attributes[key] === '1';
+    }
+  }
+  return protection;
+}
+
+function parseWorksheetColumns(root: XMLNode): ColumnConfig[] | undefined {
+  const colsNode = findChild(root, 'cols');
+  if (!colsNode) return undefined;
+
+  const colConfigs: ColumnConfig[] = [];
+  for (const col of findChildren(colsNode, 'col')) {
+    const min = Number.parseInt(col.attributes.min, 10) - 1;
+    const max = Number.parseInt(col.attributes.max, 10) - 1;
+    const width = col.attributes.width
+      ? Number.parseFloat(col.attributes.width)
+      : undefined;
+    for (let c = min; c <= max; c++) {
+      if (c >= MAX_COLS) break;
+      while (colConfigs.length <= c) colConfigs.push({});
+      colConfigs[c] = {
+        width,
+        hidden: col.attributes.hidden === '1',
+        collapsed: col.attributes.collapsed === '1',
+        outlineLevel: col.attributes.outlineLevel
+          ? Number.parseInt(col.attributes.outlineLevel, 10)
+          : undefined,
+      };
+    }
+  }
+
+  return colConfigs;
+}
+
+function parseWorksheetMergeCells(
+  root: XMLNode,
+): Worksheet['mergeCells'] | undefined {
+  const mergeCellsNode = findChild(root, 'mergeCells');
+  if (!mergeCellsNode) return undefined;
+
+  const mergeCells: NonNullable<Worksheet['mergeCells']> = [];
+  for (const mergeCellNode of findChildren(mergeCellsNode, 'mergeCell')) {
+    const ref = mergeCellNode.attributes.ref;
+    const [start, end] = ref.split(':');
+    const startMatch = start.match(CELL_REF_REGEX);
+    const endMatch = end.match(CELL_REF_REGEX);
+    if (!startMatch || !endMatch) continue;
+    mergeCells.push({
+      startRow: Number.parseInt(startMatch[2], 10) - 1,
+      startCol: letterToColIndex(startMatch[1]),
+      endRow: Number.parseInt(endMatch[2], 10) - 1,
+      endCol: letterToColIndex(endMatch[1]),
+    });
+  }
+
+  return mergeCells;
+}
+
+function parseCellValueNode(
+  cellNode: XMLNode,
+  cellType: string | undefined,
+  sharedStrings: string[],
+): { value: CellValue; type: Cell['type'] } {
+  const valueNode = findChild(cellNode, 'v');
+  if (!valueNode) {
+    return { value: null, type: 'string' };
+  }
+
+  const rawValue = getTextContent(valueNode);
+  if (cellType === 's') {
+    const index = Number.parseInt(rawValue, 10);
+    return {
+      value:
+        index >= 0 && index < sharedStrings.length
+          ? sharedStrings[index]
+          : rawValue,
+      type: 'string',
+    };
+  }
+
+  if (cellType === 'b') {
+    return { value: rawValue === '1', type: 'boolean' };
+  }
+
+  if (cellType === 'str' || cellType === 'inlineStr') {
+    return { value: rawValue, type: 'string' };
+  }
+
+  const numberValue = Number.parseFloat(rawValue);
+  return {
+    value: Number.isNaN(numberValue) ? rawValue : numberValue,
+    type: 'number',
+  };
+}
+
+function parseInlineStringValue(
+  inlineStringNode: XMLNode | undefined,
+): { value: string; richText?: RichTextRun[] } | undefined {
+  if (!inlineStringNode) return undefined;
+
+  const textNode = findChild(inlineStringNode, 't');
+  if (textNode) {
+    return { value: getTextContent(textNode) };
+  }
+
+  const richTextRuns = parseRichTextRuns(inlineStringNode);
+  if (richTextRuns.length === 0) return undefined;
+
+  return {
+    value: richTextRuns.map((run) => run.text).join(''),
+    richText: richTextRuns,
+  };
+}
+
+function parseWorksheetCell(
+  cellNode: XMLNode,
+  sharedStrings: string[],
+  styles: CellStyle[],
+): { colIndex: number; cell: Cell } | undefined {
+  const ref = cellNode.attributes.r;
+  if (!ref) return undefined;
+
+  const match = ref.match(COL_LETTER_REGEX);
+  if (!match) return undefined;
+
+  const colIndex = letterToColIndex(match[1]);
+  if (colIndex < 0 || colIndex >= MAX_COLS) return undefined;
+
+  const cellType = cellNode.attributes.t;
+  const styleIndex = Number.parseInt(cellNode.attributes.s || '0', 10);
+  const parsedValue = parseCellValueNode(cellNode, cellType, sharedStrings);
+  const inlineString = parseInlineStringValue(findChild(cellNode, 'is'));
+  const cell: Cell = {
+    value: inlineString?.value ?? parsedValue.value,
+    type: inlineString ? 'string' : parsedValue.type,
+  };
+
+  if (inlineString?.richText) {
+    cell.richText = inlineString.richText;
+  }
+
+  const formulaNode = findChild(cellNode, 'f');
+  if (formulaNode) {
+    cell.formula = getTextContent(formulaNode);
+    cell.type = 'formula';
+  }
+
+  if (styleIndex > 0 && styles[styleIndex]) {
+    cell.style = styles[styleIndex];
+  }
+
+  const numberFormat = styles[styleIndex]?.numberFormat;
+  if (typeof cell.value === 'number' && isDateNumberFormat(numberFormat)) {
+    cell.value = excelSerialToDate(cell.value);
+    if (!cell.formula) {
+      cell.type = 'date';
+    }
+  }
+
+  return { colIndex, cell };
+}
+
+function parseWorksheetRow(
+  rowNode: XMLNode,
+  sharedStrings: string[],
+  styles: CellStyle[],
+): { rowIndex: number; row: Row } | undefined {
+  const rowIndex = Number.parseInt(rowNode.attributes.r, 10) - 1;
+  if (rowIndex < 0 || rowIndex >= MAX_ROWS) return undefined;
+
+  const row: Row = { cells: [] };
+  if (rowNode.attributes.ht) {
+    row.height = Number.parseFloat(rowNode.attributes.ht);
+  }
+  row.hidden = rowNode.attributes.hidden === '1';
+  row.collapsed = rowNode.attributes.collapsed === '1';
+  if (rowNode.attributes.outlineLevel) {
+    row.outlineLevel = Number.parseInt(rowNode.attributes.outlineLevel, 10);
+  }
+
+  const cells: Cell[] = [];
+  for (const cellNode of findChildren(rowNode, 'c')) {
+    const parsedCell = parseWorksheetCell(cellNode, sharedStrings, styles);
+    if (!parsedCell) continue;
+    while (cells.length <= parsedCell.colIndex) {
+      cells.push({ value: null });
+    }
+    cells[parsedCell.colIndex] = parsedCell.cell;
+  }
+
+  row.cells = cells;
+  return { rowIndex, row };
+}
+
+function parseWorksheetRows(
+  root: XMLNode,
+  sharedStrings: string[],
+  styles: CellStyle[],
+): Row[] {
+  const sheetDataNode = findChild(root, 'sheetData');
+  if (!sheetDataNode) return [];
+
+  const rows: Row[] = [];
+  let maxRow = -1;
+
+  for (const rowNode of findChildren(sheetDataNode, 'row')) {
+    const parsedRow = parseWorksheetRow(rowNode, sharedStrings, styles);
+    if (!parsedRow) continue;
+
+    while (rows.length <= parsedRow.rowIndex) {
+      rows.push({ cells: [] });
+    }
+    rows[parsedRow.rowIndex] = parsedRow.row;
+    maxRow = Math.max(maxRow, parsedRow.rowIndex);
+  }
+
+  return maxRow >= 0 ? rows.slice(0, maxRow + 1) : [];
+}
+
+function parseWorksheetHyperlinks(
+  root: XMLNode,
+  worksheet: Worksheet,
+  sheetRelationships: SheetRelationships,
+): void {
+  const hyperlinksNode = findChild(root, 'hyperlinks');
+  if (!hyperlinksNode) return;
+
+  for (const hyperlinkNode of findChildren(hyperlinksNode, 'hyperlink')) {
+    const ref = hyperlinkNode.attributes.ref;
+    if (!ref) continue;
+
+    const refMatch = ref.match(CELL_REF_REGEX);
+    if (!refMatch) continue;
+
+    const colIndex = letterToColIndex(refMatch[1]);
+    const rowIndex = Number.parseInt(refMatch[2], 10) - 1;
+    const row = worksheet.rows[rowIndex];
+    const cell = row?.cells[colIndex];
+    if (!cell) continue;
+
+    const relationshipId = hyperlinkNode.attributes['r:id'];
+    const location = hyperlinkNode.attributes.location;
+    const tooltip = hyperlinkNode.attributes.tooltip;
+
+    let target = '';
+    if (relationshipId && sheetRelationships.hyperlinks.has(relationshipId)) {
+      target = sheetRelationships.hyperlinks.get(relationshipId) ?? '';
+    } else if (location) {
+      target = location;
+    }
+
+    if (target) {
+      cell.hyperlink = { target, tooltip };
+    }
+  }
+}
+
+function parseWorksheetViews(root: XMLNode, worksheet: Worksheet): void {
+  const sheetViews = findChild(root, 'sheetViews');
+  const sheetView = sheetViews ? findChild(sheetViews, 'sheetView') : undefined;
+  const pane = sheetView ? findChild(sheetView, 'pane') : undefined;
+  if (!pane) return;
+
+  const state = pane.attributes.state;
+  const xSplit = Number.parseFloat(pane.attributes.xSplit || '0');
+  const ySplit = Number.parseFloat(pane.attributes.ySplit || '0');
+
+  if (state === 'frozen' && (xSplit > 0 || ySplit > 0)) {
+    worksheet.freezePane = { row: ySplit, col: xSplit };
+    return;
+  }
+
+  if (xSplit > 0 || ySplit > 0) {
+    const topLeftRef = pane.attributes.topLeftCell;
+    worksheet.splitPane = {
+      x: xSplit,
+      y: ySplit,
+      topLeftCell: topLeftRef ? parseCellRef(topLeftRef) : undefined,
+    };
+  }
+}
+
+function ensureWorksheetCell(
+  worksheet: Worksheet,
+  rowIndex: number,
+  colIndex: number,
+): Cell {
+  while (worksheet.rows.length <= rowIndex) {
+    worksheet.rows.push({ cells: [] });
+  }
+
+  const row = worksheet.rows[rowIndex];
+  if (!row) {
+    const newRow: Row = { cells: [] };
+    worksheet.rows[rowIndex] = newRow;
+    return ensureWorksheetCell(worksheet, rowIndex, colIndex);
+  }
+
+  while (row.cells.length <= colIndex) {
+    row.cells.push({ value: null });
+  }
+
+  const existingCell = row.cells[colIndex];
+  if (existingCell) return existingCell;
+
+  const newCell: Cell = { value: null };
+  row.cells[colIndex] = newCell;
+  return newCell;
+}
+
+function applyWorksheetComments(
+  worksheet: Worksheet,
+  sheetRelationships: SheetRelationships,
+  zip: Record<string, Uint8Array>,
+  decoder: TextDecoder,
+): void {
+  if (!sheetRelationships.commentsPath) return;
+
+  const commentsPath = resolveSheetPartPath(
+    'xl/worksheets',
+    sheetRelationships.commentsPath,
+  );
+  const commentsData = zip[commentsPath];
+  if (!commentsData) return;
+
+  for (const entry of parseCommentsXML(decoder.decode(commentsData))) {
+    ensureWorksheetCell(worksheet, entry.row, entry.col).comment =
+      entry.comment;
+  }
+}
+
+function applyWorksheetImages(
+  worksheet: Worksheet,
+  sheetRelationships: SheetRelationships,
+  zip: Record<string, Uint8Array>,
+  decoder: TextDecoder,
+): void {
+  if (!sheetRelationships.drawingPath) return;
+
+  const drawingPath = resolveSheetPartPath(
+    'xl/worksheets',
+    sheetRelationships.drawingPath,
+  );
+  const drawingData = zip[drawingPath];
+  const drawingRelsPath = `${drawingPath.replace(
+    'xl/drawings/',
+    'xl/drawings/_rels/',
+  )}.rels`;
+  const drawingRelsData = zip[drawingRelsPath];
+  if (!drawingData || !drawingRelsData) return;
+
+  const images = parseDrawingImages(
+    decoder.decode(drawingData),
+    decoder.decode(drawingRelsData),
+    zip,
+  );
+  if (images.length > 0) {
+    worksheet.images = images;
+  }
+}
+
+function applyWorksheetTables(
+  worksheet: Worksheet,
+  sheetRelationships: SheetRelationships,
+  zip: Record<string, Uint8Array>,
+  decoder: TextDecoder,
+): void {
+  if (sheetRelationships.tablePaths.length === 0) return;
+
+  const tables = sheetRelationships.tablePaths
+    .map((tablePath) => {
+      const resolvedPath = resolveSheetPartPath('xl/worksheets', tablePath);
+      const tableData = zip[resolvedPath];
+      if (!tableData) return undefined;
+      return parseTableXML(decoder.decode(tableData));
+    })
+    .filter((table): table is NonNullable<typeof table> => !!table);
+
+  if (tables.length > 0) {
+    worksheet.tables = tables;
+  }
 }
 
 /**
@@ -553,50 +1332,23 @@ function parseWorksheet(
   sharedStrings: string[],
   styles: CellStyle[],
   differentialStyles: CellStyle[],
-  hyperlinkRelMap: Map<string, string>,
+  sheetRelationships: SheetRelationships,
+  zip: Record<string, Uint8Array>,
+  decoder: TextDecoder,
 ): Worksheet {
   const doc = parseXML(xml);
   const root = doc.children[0];
 
   const worksheet: Worksheet = { name, rows: [] };
 
-  // Parse columns
-  const colsNode = findChild(root, 'cols');
-  if (colsNode) {
-    const colConfigs: ColumnConfig[] = [];
-    for (const col of findChildren(colsNode, 'col')) {
-      const min = Number.parseInt(col.attributes.min, 10) - 1;
-      const max = Number.parseInt(col.attributes.max, 10) - 1;
-      const width = col.attributes.width
-        ? Number.parseFloat(col.attributes.width)
-        : undefined;
-      for (let c = min; c <= max; c++) {
-        if (c >= MAX_COLS) break; // cap column expansion
-        while (colConfigs.length <= c) colConfigs.push({});
-        colConfigs[c] = { width };
-      }
-    }
-    worksheet.columns = colConfigs;
+  const columns = parseWorksheetColumns(root);
+  if (columns) {
+    worksheet.columns = columns;
   }
 
-  // Parse merge cells
-  const mergeCellsNode = findChild(root, 'mergeCells');
-  if (mergeCellsNode) {
-    worksheet.mergeCells = [];
-    for (const mc of findChildren(mergeCellsNode, 'mergeCell')) {
-      const ref = mc.attributes.ref;
-      const [start, end] = ref.split(':');
-      const startMatch = start.match(CELL_REF_REGEX);
-      const endMatch = end.match(CELL_REF_REGEX);
-      if (startMatch && endMatch) {
-        worksheet.mergeCells.push({
-          startRow: Number.parseInt(startMatch[2], 10) - 1,
-          startCol: letterToColIndex(startMatch[1]),
-          endRow: Number.parseInt(endMatch[2], 10) - 1,
-          endCol: letterToColIndex(endMatch[1]),
-        });
-      }
-    }
+  const mergeCells = parseWorksheetMergeCells(root);
+  if (mergeCells) {
+    worksheet.mergeCells = mergeCells;
   }
 
   const autoFilter = parseAutoFilter(root);
@@ -612,186 +1364,39 @@ function parseWorksheet(
     worksheet.conditionalFormattings = conditionalFormattings;
   }
 
-  // Parse sheet data
-  const sheetDataNode = findChild(root, 'sheetData');
-  if (!sheetDataNode) return worksheet;
+  worksheet.rows = parseWorksheetRows(root, sharedStrings, styles);
 
-  const rows: Row[] = [];
-  let maxRow = 0;
-
-  for (const rowNode of findChildren(sheetDataNode, 'row')) {
-    const rowIndex = Number.parseInt(rowNode.attributes.r, 10) - 1;
-    if (rowIndex < 0 || rowIndex >= MAX_ROWS) continue; // bounds check
-
-    const height = rowNode.attributes.ht
-      ? Number.parseFloat(rowNode.attributes.ht)
-      : undefined;
-
-    // Ensure rows array is filled up to this index
-    while (rows.length <= rowIndex) {
-      rows.push({ cells: [] });
-    }
-
-    const row: Row = { cells: [], height };
-    const cells: Cell[] = [];
-
-    for (const cellNode of findChildren(rowNode, 'c')) {
-      const ref = cellNode.attributes.r;
-      const match = ref.match(COL_LETTER_REGEX);
-      if (!match) continue;
-
-      const colIndex = letterToColIndex(match[1]);
-      if (colIndex < 0 || colIndex >= MAX_COLS) continue; // bounds check
-
-      const cellType = cellNode.attributes.t;
-      const styleIndex = Number.parseInt(cellNode.attributes.s || '0', 10);
-
-      // Ensure cells array is filled
-      while (cells.length <= colIndex) {
-        cells.push({ value: null });
-      }
-
-      const vNode = findChild(cellNode, 'v');
-      let value: CellValue = null;
-      let type: Cell['type'] = 'string';
-
-      if (vNode) {
-        const rawValue = getTextContent(vNode);
-
-        if (cellType === 's') {
-          // Shared string
-          const idx = Number.parseInt(rawValue, 10);
-          // Bounds check shared string index
-          if (idx >= 0 && idx < sharedStrings.length) {
-            value = sharedStrings[idx];
-          } else {
-            value = rawValue;
-          }
-          type = 'string';
-        } else if (cellType === 'b') {
-          value = rawValue === '1';
-          type = 'boolean';
-        } else if (cellType === 'str' || cellType === 'inlineStr') {
-          value = rawValue;
-          type = 'string';
-        } else {
-          // Number or date
-          const num = Number.parseFloat(rawValue);
-          value = Number.isNaN(num) ? rawValue : num;
-          type = 'number';
-        }
-      }
-
-      // Check inline string
-      const isNode = findChild(cellNode, 'is');
-      if (isNode) {
-        const tNode = findChild(isNode, 't');
-        if (tNode) {
-          value = getTextContent(tNode);
-          type = 'string';
-        }
-      }
-
-      const cell: Cell = { value, type };
-
-      // Parse formula
-      const fNode = findChild(cellNode, 'f');
-      if (fNode) {
-        cell.formula = getTextContent(fNode);
-        cell.type = 'formula';
-      }
-
-      // Apply style
-      if (styleIndex > 0 && styles[styleIndex]) {
-        cell.style = styles[styleIndex];
-      }
-
-      const numberFormat =
-        styleIndex >= 0 ? styles[styleIndex]?.numberFormat : undefined;
-      if (typeof cell.value === 'number' && isDateNumberFormat(numberFormat)) {
-        cell.value = excelSerialToDate(cell.value);
-        if (!cell.formula) {
-          cell.type = 'date';
-        }
-      }
-
-      cells[colIndex] = cell;
-    }
-
-    row.cells = cells;
-    rows[rowIndex] = row;
-    maxRow = Math.max(maxRow, rowIndex);
-  }
-
-  worksheet.rows = rows.slice(0, maxRow + 1);
-
-  // Parse hyperlinks
   const dataValidations = parseDataValidations(root);
   if (dataValidations.length > 0) {
     worksheet.dataValidations = dataValidations;
   }
 
-  // Parse hyperlinks
-  const hyperlinksNode = findChild(root, 'hyperlinks');
-  if (hyperlinksNode) {
-    for (const hlNode of findChildren(hyperlinksNode, 'hyperlink')) {
-      const ref = hlNode.attributes.ref;
-      if (!ref) continue;
+  parseWorksheetHyperlinks(root, worksheet, sheetRelationships);
+  parseWorksheetViews(root, worksheet);
 
-      const refMatch = ref.match(CELL_REF_REGEX);
-      if (!refMatch) continue;
-
-      const hlCol = letterToColIndex(refMatch[1]);
-      const hlRow = Number.parseInt(refMatch[2], 10) - 1;
-
-      if (hlRow >= 0 && hlRow < worksheet.rows.length) {
-        const row = worksheet.rows[hlRow];
-        if (row && hlCol >= 0 && hlCol < row.cells.length) {
-          const cell = row.cells[hlCol];
-          if (cell) {
-            const rId = hlNode.attributes['r:id'];
-            const location = hlNode.attributes.location;
-            const tooltip = hlNode.attributes.tooltip;
-
-            let target = '';
-            if (rId && hyperlinkRelMap.has(rId)) {
-              target = hyperlinkRelMap.get(rId) ?? '';
-            } else if (location) {
-              target = location;
-            }
-
-            if (target) {
-              cell.hyperlink = { target, tooltip };
-            }
-          }
-        }
-      }
-    }
+  const headerFooter = parseHeaderFooter(root);
+  if (headerFooter) {
+    worksheet.headerFooter = headerFooter;
   }
 
-  // Parse freeze pane
-  const sheetViews = findChild(root, 'sheetViews');
-  if (sheetViews) {
-    const sheetView = findChild(sheetViews, 'sheetView');
-    if (sheetView) {
-      const pane = findChild(sheetView, 'pane');
-      if (pane) {
-        const state = pane.attributes.state;
-        const xSplit = Number.parseFloat(pane.attributes.xSplit || '0');
-        const ySplit = Number.parseFloat(pane.attributes.ySplit || '0');
-        if (state === 'frozen' && (xSplit > 0 || ySplit > 0)) {
-          worksheet.freezePane = { row: ySplit, col: xSplit };
-        } else if (xSplit > 0 || ySplit > 0) {
-          const topLeftRef = pane.attributes.topLeftCell;
-          worksheet.splitPane = {
-            x: xSplit,
-            y: ySplit,
-            topLeftCell: topLeftRef ? parseCellRef(topLeftRef) : undefined,
-          };
-        }
-      }
-    }
+  const pageMargins = parsePageMargins(root);
+  if (pageMargins) {
+    worksheet.pageMargins = pageMargins;
   }
+
+  const pageSetup = parsePageSetup(root);
+  if (pageSetup) {
+    worksheet.pageSetup = pageSetup;
+  }
+
+  const protection = parseWorksheetProtection(root);
+  if (protection) {
+    worksheet.protection = protection;
+  }
+
+  applyWorksheetComments(worksheet, sheetRelationships, zip, decoder);
+  applyWorksheetImages(worksheet, sheetRelationships, zip, decoder);
+  applyWorksheetTables(worksheet, sheetRelationships, zip, decoder);
 
   return worksheet;
 }

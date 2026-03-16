@@ -10,6 +10,12 @@ import {
 } from '../src';
 
 const TMP = './tests/.tmp';
+const PNG_1X1 = Uint8Array.from(
+  Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mP8/5+hHgAHggJ/PF6edAAAAABJRU5ErkJggg==',
+    'base64',
+  ),
+);
 
 beforeAll(() => {
   mkdirSync(TMP, { recursive: true });
@@ -255,6 +261,114 @@ describe('Excel Stream Writer', () => {
     }
   });
 
+  test('writes stream with rich text and worksheet settings', async () => {
+    const path = `${TMP}/stream-rich-settings.xlsx`;
+    const stream = createExcelStream(path, {
+      sheetName: 'Report',
+      state: 'hidden',
+      pageSetup: { orientation: 'landscape' },
+      headerFooter: {
+        oddHeader: { center: 'Quarterly Report' },
+      },
+      printArea: { startRow: 0, startCol: 0, endRow: 1, endCol: 1 },
+    });
+
+    stream.writeRow({
+      cells: [
+        {
+          value: 'Rich text',
+          richText: [
+            { text: 'Rich ', font: { bold: true } },
+            { text: 'text', font: { italic: true, color: 'FF0000' } },
+          ],
+        },
+        { value: 'B1' },
+      ],
+    });
+    stream.writeRow(['A2', 'B2']);
+    await stream.end();
+
+    const wb = await readExcel(path);
+    expect(wb.worksheets[0].state).toBe('hidden');
+    expect(wb.worksheets[0].pageSetup?.orientation).toBe('landscape');
+    expect(wb.worksheets[0].headerFooter?.oddHeader?.center).toBe(
+      'Quarterly Report',
+    );
+    expect(wb.worksheets[0].printArea).toEqual({
+      startRow: 0,
+      startCol: 0,
+      endRow: 1,
+      endCol: 1,
+    });
+    expect(wb.worksheets[0].rows[0].cells[0].richText).toEqual([
+      { text: 'Rich ', font: { bold: true } },
+      { text: 'text', font: { italic: true, color: 'FF0000' } },
+    ]);
+  });
+
+  test('writes stream with comments, images, and tables', async () => {
+    const path = `${TMP}/stream-comments-images-tables.xlsx`;
+    const stream = createExcelStream(path, {
+      sheetName: 'Assets',
+      images: [
+        {
+          data: PNG_1X1,
+          format: 'png',
+          range: { startRow: 4, startCol: 0, endRow: 5, endCol: 1 },
+          name: 'Logo',
+        },
+      ],
+      tables: [
+        {
+          name: 'AssetTable',
+          range: { startRow: 0, startCol: 0, endRow: 2, endCol: 2 },
+          headerRow: true,
+          totalsRow: false,
+          columns: [{ name: 'Name' }, { name: 'Value' }, { name: 'Link' }],
+        },
+      ],
+    });
+
+    stream.writeRow({
+      cells: [
+        { value: 'Name', comment: { text: 'Header comment', author: 'Loc' } },
+        { value: 'Value' },
+        { value: 'Link' },
+      ],
+    });
+    stream.writeRow({
+      cells: [
+        { value: 'A' },
+        { value: 1 },
+        { value: 'Docs', hyperlink: { target: 'https://bun.sh' } },
+      ],
+    });
+    stream.writeRow({
+      cells: [
+        { value: 'B', comment: { text: 'Body comment' } },
+        { value: 2 },
+        { value: 'Guide' },
+      ],
+    });
+    await stream.end();
+
+    const sheet = (await readExcel(path)).worksheets[0];
+    expect(sheet.rows[0].cells[0].comment?.author).toBe('Loc');
+    expect(sheet.rows[2].cells[0].comment?.text).toBe('Body comment');
+    expect(sheet.images?.[0].range).toEqual({
+      startRow: 4,
+      startCol: 0,
+      endRow: 5,
+      endCol: 1,
+    });
+    expect(sheet.tables?.[0].name).toBe('AssetTable');
+    expect(sheet.tables?.[0].columns?.map((column) => column.name)).toEqual([
+      'Name',
+      'Value',
+      'Link',
+    ]);
+  });
+
   test('handles large stream (10K rows)', async () => {
     const path = `${TMP}/stream-large.xlsx`;
     const stream = createExcelStream(path, { sheetName: 'Large' });
@@ -385,6 +499,59 @@ describe('Multi-Sheet Stream Writer', () => {
     if (rule?.type === 'expression') {
       expect(rule.style?.fill?.fgColor).toBe('C6EFCE');
     }
+  });
+
+  test('writes multiple sheets with comments, images, and tables', async () => {
+    const path = `${TMP}/multi-stream-comments-images-tables.xlsx`;
+    const stream = createMultiSheetExcelStream(path);
+
+    stream.addSheet('Sheet1', {
+      images: [
+        {
+          data: PNG_1X1,
+          format: 'png',
+          range: { startRow: 4, startCol: 0, endRow: 5, endCol: 1 },
+          name: 'Logo',
+        },
+      ],
+      tables: [
+        {
+          name: 'AssetsTable',
+          range: { startRow: 0, startCol: 0, endRow: 2, endCol: 2 },
+          columns: [{ name: 'Name' }, { name: 'Value' }, { name: 'Link' }],
+        },
+      ],
+    });
+    stream.writeRow({
+      cells: [
+        { value: 'Name', comment: { text: 'Header comment', author: 'Loc' } },
+        { value: 'Value' },
+        { value: 'Link' },
+      ],
+    });
+    stream.writeRow(['A', 1, 'Docs']);
+    stream.writeRow(['B', 2, 'Guide']);
+
+    stream.addSheet('Notes');
+    stream.writeRow({
+      cells: [{ value: 'Reminder', comment: { text: 'Second sheet note' } }],
+    });
+
+    await stream.end();
+
+    const wb = await readExcel(path);
+    expect(wb.worksheets).toHaveLength(2);
+    expect(wb.worksheets[0].rows[0].cells[0].comment?.author).toBe('Loc');
+    expect(wb.worksheets[0].images?.[0].range).toEqual({
+      startRow: 4,
+      startCol: 0,
+      endRow: 5,
+      endCol: 1,
+    });
+    expect(wb.worksheets[0].tables?.[0].name).toBe('AssetsTable');
+    expect(wb.worksheets[1].rows[0].cells[0].comment?.text).toBe(
+      'Second sheet note',
+    );
   });
 });
 
@@ -605,6 +772,61 @@ describe('Chunked Stream Writer', () => {
       expect(rule.color).toBe('5B9BD5');
       expect(rule.showValue).toBe(false);
     }
+  });
+
+  test('chunked stream with comments, images, and tables', async () => {
+    const path = `${TMP}/chunked-comments-images-tables.xlsx`;
+    const stream = createChunkedExcelStream(path, {
+      sheetName: 'Assets',
+      images: [
+        {
+          data: PNG_1X1,
+          format: 'png',
+          range: { startRow: 4, startCol: 0, endRow: 5, endCol: 1 },
+          name: 'Logo',
+        },
+      ],
+      tables: [
+        {
+          name: 'ChunkedAssetTable',
+          range: { startRow: 0, startCol: 0, endRow: 2, endCol: 2 },
+          columns: [{ name: 'Name' }, { name: 'Value' }, { name: 'Link' }],
+        },
+      ],
+    });
+
+    stream.writeRow({
+      cells: [
+        { value: 'Name', comment: { text: 'Header comment', author: 'Loc' } },
+        { value: 'Value' },
+        { value: 'Link' },
+      ],
+    });
+    stream.writeRow(['A', 1, 'Docs']);
+    stream.writeRow({
+      cells: [
+        { value: 'B', comment: { text: 'Body comment' } },
+        { value: 2 },
+        { value: 'Guide' },
+      ],
+    });
+    await stream.end();
+
+    const sheet = (await readExcel(path)).worksheets[0];
+    expect(sheet.rows[0].cells[0].comment?.author).toBe('Loc');
+    expect(sheet.rows[2].cells[0].comment?.text).toBe('Body comment');
+    expect(sheet.images?.[0].range).toEqual({
+      startRow: 4,
+      startCol: 0,
+      endRow: 5,
+      endCol: 1,
+    });
+    expect(sheet.tables?.[0].name).toBe('ChunkedAssetTable');
+    expect(sheet.tables?.[0].columns?.map((column) => column.name)).toEqual([
+      'Name',
+      'Value',
+      'Link',
+    ]);
   });
 
   test('chunked stream supports uncompressed ZIP output', async () => {

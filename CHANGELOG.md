@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add cell comments / notes support across normal, streaming, chunked, and multi-sheet Excel writers, with `readExcel()` round-trip parsing
+- Add worksheet image embedding support for PNG, JPEG, and GIF assets via `worksheet.images`
+- Add structured table support via `worksheet.tables`, including read/write of table definitions and streaming writer support
+
 ### Changed
 - Switch `createExcelStream()` to the same disk-backed Bun `FileSink`/temp-file path instead of buffering serialized row XML in memory
 - Refactor multi-sheet streaming writes to assemble worksheets from disk-backed temp files rather than buffering all rows in memory
