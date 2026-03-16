@@ -48,6 +48,22 @@ describe('Excel Writer', () => {
     expect(wb.worksheets[2].name).toBe('Third');
   });
 
+  test('writes Excel to Bun.file target', async () => {
+    const path = `${TMP}/bun-file-target.xlsx`;
+    await writeExcel(Bun.file(path), {
+      worksheets: [
+        {
+          name: 'Sheet1',
+          rows: [{ cells: [{ value: 'Hello' }, { value: 123 }] }],
+        },
+      ],
+    });
+
+    const wb = await readExcel(path);
+    expect(wb.worksheets[0].rows[0].cells[0].value).toBe('Hello');
+    expect(wb.worksheets[0].rows[0].cells[1].value).toBe(123);
+  });
+
   test('writes cell styles', async () => {
     const path = `${TMP}/styles.xlsx`;
     const style: CellStyle = {
@@ -231,6 +247,22 @@ describe('Excel Reader', () => {
     expect(wb.worksheets[0].rows[0].cells[0].value).toBe('Name');
     expect(wb.worksheets[0].rows[1].cells[0].value).toBe('Alice');
     expect(wb.worksheets[0].rows[1].cells[1].value).toBe(28);
+  });
+
+  test('reads Excel from Bun.file source', async () => {
+    const path = `${TMP}/bun-file-source.xlsx`;
+    await writeExcel(path, {
+      worksheets: [
+        {
+          name: 'Data',
+          rows: [{ cells: [{ value: 'Alice' }, { value: 28 }] }],
+        },
+      ],
+    });
+
+    const wb = await readExcel(Bun.file(path));
+    expect(wb.worksheets[0].rows[0].cells[0].value).toBe('Alice');
+    expect(wb.worksheets[0].rows[0].cells[1].value).toBe(28);
   });
 
   test('reads boolean values', async () => {

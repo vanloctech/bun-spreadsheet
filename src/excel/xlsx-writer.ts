@@ -2,9 +2,14 @@
 // XLSX Writer — Bun-optimized Excel writing
 // ============================================
 
-import { resolve } from 'node:path';
 import { type Zippable, zipSync } from 'fflate';
-import type { ExcelWriteOptions, Workbook, Worksheet } from '../types';
+import { toWriteTarget } from '../runtime-io';
+import type {
+  ExcelWriteOptions,
+  FileTarget,
+  Workbook,
+  Worksheet,
+} from '../types';
 import { buildAutoFilterXML } from './auto-filter';
 import { buildConditionalFormattingsXML } from './conditional-formatting';
 import { buildDataValidationsXML } from './data-validation';
@@ -31,20 +36,13 @@ const encoder = new TextEncoder();
  * Uses Bun.write() for optimized file output
  */
 export async function writeExcel(
-  path: string,
+  target: FileTarget,
   workbook: Workbook,
   options?: ExcelWriteOptions,
 ): Promise<void> {
   const buffer = buildExcelBuffer(workbook, options);
-
-  // Validate and resolve path
-  const resolvedPath = resolve(path);
-  if (resolvedPath.includes('\0')) {
-    throw new Error('Invalid file path: contains null bytes');
-  }
-
   // Use Bun.write() for optimized writing
-  await Bun.write(resolvedPath, buffer);
+  await Bun.write(toWriteTarget(target), buffer);
 }
 
 /**

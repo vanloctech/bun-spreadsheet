@@ -2,11 +2,12 @@
 // CSV Writer — Bun-optimized CSV writing
 // ============================================
 
-import { resolve } from 'node:path';
+import { toWriteTarget, validatePath } from '../runtime-io';
 import type {
   Cell,
   CellValue,
   CSVWriteOptions,
+  FileTarget,
   Row,
   StreamWriter,
   Workbook,
@@ -14,14 +15,6 @@ import type {
 
 // Characters that trigger formula interpretation in Excel/Google Sheets
 const FORMULA_TRIGGER_CHARS = ['=', '+', '-', '@', '\t', '\r'];
-
-/** Validate path for security */
-function validatePath(filePath: string): string {
-  if (filePath.includes('\0')) {
-    throw new Error('Invalid file path: contains null bytes');
-  }
-  return resolve(filePath);
-}
 
 const DEFAULT_OPTIONS: Required<CSVWriteOptions> = {
   delimiter: ',',
@@ -107,7 +100,7 @@ function rowToCSVLine(
  * Uses Bun.write() for optimized file writing
  */
 export async function writeCSV(
-  path: string,
+  target: FileTarget,
   data: Workbook | CellValue[][],
   options?: CSVWriteOptions,
 ): Promise<void> {
@@ -158,7 +151,7 @@ export async function writeCSV(
   const content = prefix + lines.join(opts.lineEnding) + opts.lineEnding;
 
   // Use Bun.write() for optimized writing
-  await Bun.write(validatePath(path), content);
+  await Bun.write(toWriteTarget(target), content);
 }
 
 /**

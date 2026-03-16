@@ -2,15 +2,19 @@
 // CSV Reader — Bun-optimized CSV parsing
 // ============================================
 
-import { resolve } from 'node:path';
-
 // Top-level regex for performance (biome: useTopLevelRegex)
 const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?/;
 
+import {
+  describeFileSource,
+  getRuntimeFileSize,
+  toReadableFile,
+} from '../runtime-io';
 import type {
   Cell,
   CellValue,
   CSVReadOptions,
+  FileSource,
   Row,
   Workbook,
   Worksheet,
@@ -141,28 +145,21 @@ function detectCellValue(raw: string): CellValue {
  * Uses Bun.file().text() for optimized file reading
  */
 export async function readCSV(
-  path: string,
+  source: FileSource,
   options?: CSVReadOptions,
 ): Promise<Workbook> {
   const opts = { ...DEFAULT_OPTIONS, ...options };
-
-  // Validate and resolve path (prevent path traversal)
-  const resolvedPath = resolve(path);
-  if (resolvedPath.includes('\0')) {
-    throw new Error('Invalid file path: contains null bytes');
-  }
-
-  // Use Bun.file() for optimized reading
-  const file = Bun.file(resolvedPath);
+  const file = toReadableFile(source);
   const exists = await file.exists();
   if (!exists) {
-    throw new Error(`File not found: ${resolvedPath}`);
+    throw new Error(`File not found: ${describeFileSource(source)}`);
   }
 
   // Check file size before loading into memory
-  if (file.size > MAX_CSV_FILE_SIZE) {
+  const fileSize = await getRuntimeFileSize(file);
+  if (fileSize > MAX_CSV_FILE_SIZE) {
     throw new Error(
-      `CSV file too large: ${file.size} bytes (max: ${MAX_CSV_FILE_SIZE}). Use readCSVStream() for large files.`,
+      `CSV file too large: ${fileSize} bytes (max: ${MAX_CSV_FILE_SIZE}). Use readCSVStream() for large files.`,
     );
   }
 
@@ -199,23 +196,15 @@ export async function readCSV(
  * Returns an AsyncGenerator that yields rows one at a time
  */
 export async function* readCSVStream(
-  path: string,
+  source: FileSource,
   options?: CSVReadOptions,
 ): AsyncGenerator<Row, void, unknown> {
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const { delimiter, quoteChar, skipEmptyLines } = opts;
-
-  // Validate and resolve path
-  const resolvedPath = resolve(path);
-  if (resolvedPath.includes('\0')) {
-    throw new Error('Invalid file path: contains null bytes');
-  }
-
-  // Use Bun.file().stream() for streaming read
-  const file = Bun.file(resolvedPath);
+  const file = toReadableFile(source);
   const exists = await file.exists();
   if (!exists) {
-    throw new Error(`File not found: ${resolvedPath}`);
+    throw new Error(`File not found: ${describeFileSource(source)}`);
   }
 
   const stream = file.stream();

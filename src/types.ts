@@ -2,6 +2,12 @@
 // bun-spreadsheet — Core Type Definitions
 // ============================================
 
+/** Input source for reading spreadsheet data */
+export type FileSource = string | Bun.BunFile | Bun.S3File;
+
+/** Output target for writing spreadsheet data */
+export type FileTarget = string | Bun.BunFile | Bun.S3File;
+
 /** Cell value types */
 export type CellValue = string | number | boolean | Date | null | undefined;
 

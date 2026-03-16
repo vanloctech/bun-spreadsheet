@@ -2,8 +2,12 @@
 // XLSX Reader — Bun-optimized Excel file reader
 // ============================================
 
-import { resolve } from 'node:path';
 import { unzipSync } from 'fflate';
+import {
+  describeFileSource,
+  getRuntimeFileSize,
+  toReadableFile,
+} from '../runtime-io';
 import type {
   AlignmentStyle,
   BorderEdgeStyle,
@@ -13,6 +17,7 @@ import type {
   CellValue,
   ColumnConfig,
   ExcelReadOptions,
+  FileSource,
   FillStyle,
   FontStyle,
   Row,
@@ -64,31 +69,24 @@ const MAX_SHARED_STRINGS = 10_000_000; // 10M max shared strings
  * Uses Bun.file().arrayBuffer() for optimized binary reading
  */
 export async function readExcel(
-  path: string,
+  source: FileSource,
   options?: ExcelReadOptions,
 ): Promise<Workbook> {
   const opts = options || {};
-
-  // Validate and resolve path
-  const resolvedPath = resolve(path);
-  if (resolvedPath.includes('\0')) {
-    throw new Error('Invalid file path: contains null bytes');
-  }
-
-  // Use Bun.file() for optimized file reading
-  const file = Bun.file(resolvedPath);
+  const file = toReadableFile(source);
   const exists = await file.exists();
   if (!exists) {
-    throw new Error(`File not found: ${resolvedPath}`);
+    throw new Error(`File not found: ${describeFileSource(source)}`);
   }
 
-  // Read bytes directly as Uint8Array for unzipSync()
-  const buffer = await file.bytes();
-  if (buffer.byteLength > MAX_FILE_SIZE) {
+  const fileSize = await getRuntimeFileSize(file);
+  if (fileSize > MAX_FILE_SIZE) {
     throw new Error(
-      `File too large: ${buffer.byteLength} bytes (max: ${MAX_FILE_SIZE})`,
+      `File too large: ${fileSize} bytes (max: ${MAX_FILE_SIZE})`,
     );
   }
+  // Read bytes directly as Uint8Array for unzipSync()
+  const buffer = await file.bytes();
 
   // Zip bomb prevention — check sizes BEFORE decompression via filter callback.
   // fflate's filter receives originalSize (uncompressed) for each entry

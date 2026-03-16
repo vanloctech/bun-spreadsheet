@@ -48,6 +48,8 @@ export type {
   DataValidation,
   ExcelReadOptions,
   ExcelWriteOptions,
+  FileSource,
+  FileTarget,
   FillStyle,
   FontStyle,
   Hyperlink,

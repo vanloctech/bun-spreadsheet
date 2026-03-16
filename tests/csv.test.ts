@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdirSync, rmSync } from 'node:fs';
-import { readCSV, writeCSV } from '../src';
+import { readCSV, readCSVStream, writeCSV } from '../src';
 
 const TMP = './tests/.tmp';
 
@@ -73,6 +73,18 @@ describe('CSV Writer', () => {
     const content = await Bun.file(path).text();
     expect(content).toContain('"He said ""hello"""');
   });
+
+  test('writes CSV to Bun.file target', async () => {
+    const path = `${TMP}/bun-file-target.csv`;
+    await writeCSV(Bun.file(path), [
+      ['Name', 'Age'],
+      ['Alice', 28],
+    ]);
+
+    const content = await Bun.file(path).text();
+    expect(content).toContain('Alice');
+    expect(content).toContain('28');
+  });
 });
 
 describe('CSV Reader', () => {
@@ -132,5 +144,30 @@ describe('CSV Reader', () => {
     expect(rows[0].cells[0].value).toBe('Name');
     expect(rows[1].cells[1].value).toBe(95);
     expect(rows[2].cells[1].value).toBe(87);
+  });
+
+  test('reads CSV from Bun.file source', async () => {
+    const path = `${TMP}/bun-file-source.csv`;
+    await Bun.write(path, 'Name,Age\nAlice,28\nBob,32');
+
+    const wb = await readCSV(Bun.file(path));
+    expect(wb.worksheets[0].rows[1].cells[0].value).toBe('Alice');
+    expect(wb.worksheets[0].rows[1].cells[1].value).toBe(28);
+  });
+
+  test('streams CSV from Bun.file source', async () => {
+    const path = `${TMP}/bun-file-stream.csv`;
+    await Bun.write(path, 'Name,Age\nAlice,28\nBob,32');
+
+    const rows = [];
+    for await (const row of readCSVStream(Bun.file(path), {
+      hasHeader: true,
+    })) {
+      rows.push(row);
+    }
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0].cells[0].value).toBe('Alice');
+    expect(rows[1].cells[1].value).toBe(32);
   });
 });
