@@ -36,4 +36,4 @@ jobs:
         run: bun test
 
       - name: Run demo (smoke test)
-        run: bun run demo
+        run: bun run examples/demo.ts
