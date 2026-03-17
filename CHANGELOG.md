@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-03-17
+
+### Fixed
+- Resolve XML entity decoding and template-mode cell patch handling
+- Remove redundant runtime patterns that triggered IDE warnings in ZIP and streaming writer code paths
+
+### Security
+- Prevent double-unescape issues when decoding XML entities
+- Harden template mode further against prototype-polluting input keys
+
 ## [1.2.0] - 2026-03-17
 
 ### Added
